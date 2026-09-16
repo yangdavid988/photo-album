@@ -1,0 +1,51 @@
+#
+# Photo Album Application Kconfig options
+# These are sourced by the Ameba SDK via:
+#   component/soc/amebagreen2/project/Kconfig → orsource "${RTK_APP_DIR}/Kconfig"
+#
+# Use "ameba.py menuconfig" (bm) to configure interactively.
+#
+# ========================================================================
+# Config mechanics (verified against the SDK Kconfig, kconfiglib 14.1)
+# ========================================================================
+# 1. 'select' on CHOICE symbols has no effect (Kconfiglib warning).
+#    LVGL_9_3 ("LVGL Version" choice) and T1720A_MENU ("Select Panel"
+#    choice) can only be pinned through .config / prj.conf user values —
+#    never through this Kconfig.
+#
+# 2. 'bms' (menuconfig -s prj.conf) only EXPORTS menuconfig/.config →
+#    prj.conf.  It never imports prj.conf.  To pick panel/LVGL: bm → set
+#    options → EXIT with "Save configuration? Yes", then bms to persist.
+#
+# 3. ameba build re-applies prj.conf ONLY when no .config exists yet
+#    (manager.py apply_default_config).  Editing prj.conf by hand and
+#    rebuilding normally does NOTHING — use 'bp' (ameba.py build -p) or
+#    delete build_*/menuconfig/.config first.
+#
+# Chain enforced here (non-choice symbols only, selects are valid):
+#   SCREEN_T1720A (default y)
+#     ├─ select GRAPHIC_UI_MENU  → SDK sources ui/Kconfig (GRAPHIC_UI)
+#     └─ select LVGL_ENABLE      → Graphics Library Selection
+#   Pinned by prj.conf user values (choice members):
+#     ├─ CONFIG_LVGL_9_3=y       → version choice (auto-selects libjpeg-turbo)
+#     └─ CONFIG_T1720A_MENU=y    → Panel choice (selects T1720A for the
+#                                  SDK gt911 / display_mode_setting units)
+#
+
+menu "Photo Album Application"
+
+config SCREEN_T1720A
+    bool "T1720A panel (800x480 RGB-888 parallel, GT911 touch)"
+    default y
+    select GRAPHIC_UI_MENU
+    select LVGL_ENABLE
+    help
+        Display panel used by this demo.  T1720A is the only supported
+        panel: 800x480 RGB-888 parallel interface with GT911 capacitive
+        touch (required for the album swipe gestures).
+
+        Our app code keys off CONFIG_SCREEN_T1720A (hal/lcd/lcd_drv.c,
+        backlight_ctrl.c, main/app_main.c).  The SDK's own panel symbol
+        (T1720A_MENU → T1720A) is pinned via prj.conf — see file header.
+
+endmenu
