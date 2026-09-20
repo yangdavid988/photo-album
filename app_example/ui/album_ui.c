@@ -26,15 +26,17 @@
  *   swipe used to mis-fire the slideshow; the action is therefore DEFERRED
  *   to release and gated on "finger stayed put + no gesture fired".
  *
- * Photo table is generated into assets/photos/album_photos.h by
- * tools/jpg2album.py.
+ * Photo sources: an SD card (VFS + FatFS, storage/album_sd.c) when a readable
+ * card is present, else the flash C-array table (assets/photos/album_photos.h,
+ * from tools/jpg2album.py).  Both feed the same HW decode path.
  */
 
 #include "ui/album_ui.h"
 #include "config/album_config.h"
 #include "config/threshold_config.h"  /* BL_STEP_PCT for brightness gestures */
 #include "core/jpeg_decode.h"
-#include "assets/photos/album_photos.h"
+#include "assets/photos/album_photos.h" /* flash fallback album (builtin) */
+#include "storage/album_sd.h"            /* SD-card album (VFS+FatFS)      */
 #include "hal/backlight_ctrl.h"
 #include "hal/lcd/lcd_drv.h"
 
@@ -59,12 +61,19 @@
  * ======================================================================== */
 static uint32_t s_fb[2] = {0, 0}; /* LCDC framebuffer bases (PSRAM) */
 
+/* SD album first, flash C-array table as fallback. */
+static bool s_use_sd = false;
+
 static lv_obj_t* s_info_bar   = NULL;
 static lv_obj_t* s_info_label = NULL;
 static lv_obj_t* s_hint_label = NULL;
 
 static int  s_cur_index = -1;
 static bool s_has_photo = false;
+
+/* Source JPEG dimensions, from the header probe; 0 until the first render. */
+static uint32_t s_cur_w = 0;
+static uint32_t s_cur_h = 0;
 
 static lv_timer_t* s_slideshow_timer = NULL;
 static bool        s_slideshow_on    = false;
@@ -74,6 +83,10 @@ static bool        s_bar_visible    = true;  /* bar drawn by LVGL?           */
 static uint8_t     s_fit_mode       = FIT_COVER; /* FIT_COVER / FIT_LETTERBOX */
 static lv_timer_t* s_autohide_timer = NULL;  /* periodic auto-hide check     */
 static uint32_t    s_last_input_ms  = 0;     /* bar auto-hide reference tick */
+
+/* SD-unreadable recovery dialog.  NULL when not shown.  One at a time. */
+static lv_obj_t* s_recover_msgbox = NULL;
+static void show_sd_recover_dialog(void); /* defined below the timers */
 
 /* Double-tap detection, ported from pc_dashboard touch_gesture.c: LVGL's
  * DOUBLE_CLICKED is only sent to the clicked object, never to the indev, so
@@ -117,24 +130,74 @@ static bool s_photo_dirty = false;
 static void render_current_photo(void);
 
 /* ========================================================================
+ * Photo source accessors — SD album or flash table.  album_sd_at() returns a
+ * pointer into a shared PSRAM buffer that the next call overwrites, so a photo
+ * is decoded as soon as it is fetched.
+ * ======================================================================== */
+static int photo_count(void)
+{
+    return s_use_sd ? album_sd_count() : album_photo_count();
+}
+
+static const uint8_t* photo_data(int index, uint32_t* len, const char** name)
+{
+    if (s_use_sd)
+    {
+        const sd_photo_t* p = album_sd_at(index);
+        if (p == NULL)
+            return NULL;
+        *len  = p->len;
+        *name = p->name;
+        return p->data;
+    }
+    else
+    {
+        const album_photo_t* p = album_photo_at(index);
+        if (p == NULL)
+            return NULL;
+        *len  = p->len;
+        *name = p->name;
+        return p->data;
+    }
+}
+
+/* ========================================================================
  * Info bar
  * ======================================================================== */
 static void info_bar_update(void)
 {
-    char buf[96];
+    char buf[128];
+    int count = photo_count();
 
     /* Label text stays inside the Montserrat ASCII glyph range */
-    if (album_photo_count() <= 0)
+    if (count <= 0)
     {
-        lv_label_set_text(s_info_label, "No photos - run tools/jpg2album.py");
+        lv_label_set_text(s_info_label, s_use_sd
+                          ? "No photos on SD - use JPG folder"
+                          : "No photos - run tools/jpg2album.py");
     }
     else
     {
-        const album_photo_t* p = album_photo_at(s_cur_index);
-        snprintf(buf, sizeof(buf), "%d/%d   %s   [%s]",
-                 s_cur_index + 1, album_photo_count(),
-                 (p != NULL && p->name != NULL) ? p->name : "?",
-                 s_fit_mode == FIT_COVER ? "cover" : "fit");
+        const char* name = s_use_sd ? album_sd_name(s_cur_index)
+                                    : ((album_photo_at(s_cur_index) != NULL)
+                                       ? album_photo_at(s_cur_index)->name : NULL);
+        if (s_cur_w > 0 && s_cur_h > 0)
+        {
+            snprintf(buf, sizeof(buf), "%d/%d   [%s] %s %dx%d   [%s]",
+                     s_cur_index + 1, count,
+                     s_use_sd ? "SD" : "FLASH",
+                     (name != NULL) ? name : "?",
+                     (int) s_cur_w, (int) s_cur_h,
+                     s_fit_mode == FIT_COVER ? "cover" : "fit");
+        }
+        else
+        {
+            snprintf(buf, sizeof(buf), "%d/%d   [%s] %s   [%s]",
+                     s_cur_index + 1, count,
+                     s_use_sd ? "SD" : "FLASH",
+                     (name != NULL) ? name : "?",
+                     s_fit_mode == FIT_COVER ? "cover" : "fit");
+        }
         lv_label_set_text(s_info_label, buf);
     }
 
@@ -154,6 +217,9 @@ static void refr_ready_hook(lv_event_t* e)
         /* OSD is painted over the photo rows — a decode now would wipe it.
          * Keep the flag; osd_hide_del() re-decodes once the OSD is gone. */
         if (s_osd != NULL)
+            return;
+        /* Recovery dialog up = PP held; re-decode later (flag stays set). */
+        if (s_recover_msgbox != NULL)
             return;
         render_current_photo();
         s_photo_dirty = false;
@@ -239,33 +305,48 @@ static void blit_centered_argb(uint32_t fb, const uint8_t* src, uint32_t fw, uin
     DCache_Clean(fb, (uint32_t) ALBUM_SCREEN_W * ALBUM_SCREEN_H * 4u);
 }
 
-/* Decode one photo full-screen into both FBs.
- * FIT_COVER: PP crop-to-fill directly into the FBs (tight FB rows).
- * FIT_LETTERBOX: aspect-true scale → scratch, CPU blit + black bars.
- * @return number of FBs successfully written (0, 1 or 2). */
-static int render_photo_to_fbs(const album_photo_t* p)
+/* PP upscales at most 3×.  FIT_COVER crops before scaling, so the magnification
+ * is set by the cropped block; a source that needs >3× as a whole can never be
+ * covered, and PPSetConfig would fail with PP_SET_OUT_SIZE_INVALID. */
+static bool cover_fit_possible(uint32_t srcW, uint32_t srcH)
+{
+    return !(PHOTO_W > 3u * srcW || PHOTO_H > 3u * srcH);
+}
+
+/* Decode one photo into both FBs — source-agnostic, any JPEG stream works.
+ * FIT_COVER: PP crop-to-fill into the FBs.  FIT_LETTERBOX: aspect-true scale to
+ * scratch, CPU blit + black bars.
+ * @return number of FBs written (0, 1 or 2). */
+static int render_photo_stream(const uint8_t* data, uint32_t len)
 {
     int ok = 0;
 
-    uint32_t fw = 0, fh = 0;
-    if (s_fit_mode == FIT_LETTERBOX)
+    /* Size first: cover needs it to avoid the >3× PP rejection, and the info
+     * bar shows the source dimensions. */
+    uint32_t srcW = 0, srcH = 0;
+    bool have_size = (jpeg_peek_size(data, len, &srcW, &srcH) == 0
+                      && srcW > 0 && srcH > 0);
+    s_cur_w = have_size ? srcW : 0;
+    s_cur_h = have_size ? srcH : 0;
+    int  mode = s_fit_mode;
+
+    if (mode == FIT_COVER && have_size && !cover_fit_possible(srcW, srcH))
     {
-        if (jpeg_peek_size(p->data, p->len, &fw, &fh) != 0 || fw == 0 || fh == 0)
+        RTK_LOGI(TAG, "cover %dx%d >3x upscale -> letterbox for this photo\n",
+                 (int) srcW, (int) srcH);
+        mode = FIT_LETTERBOX;
+    }
+
+    uint32_t fw = 0, fh = 0;
+    if (mode == FIT_LETTERBOX)
+    {
+        if (have_size && letterbox_scale(srcW, srcH, &fw, &fh))
         {
-            RTK_LOGE(TAG, "peek size failed, fall back to cover\n");
-            s_fit_mode = FIT_COVER;
-        }
-        else if (!letterbox_scale(fw, fh, &fw, &fh))
-        {
-            RTK_LOGE(TAG, "src %dx%d unfit for letterbox (>3x upscale)\n",
-                     (int) fw, (int) fh);
-            s_fit_mode = FIT_COVER;
-        }
-        else
-        {
+            RTK_LOGI(TAG, "letterbox: src %dx%d -> tight %dx%d\n",
+                     (int) srcW, (int) srcH, (int) fw, (int) fh);
             jpeg_dec_req_t req = {0};
-            req.jpeg_data  = p->data;
-            req.jpeg_len   = p->len;
+            req.jpeg_data  = data;
+            req.jpeg_len   = len;
             req.out_buffer = s_lb_scratch;
             req.out_w      = fw;
             req.out_h      = fh; /* tight scratch, no FB window */
@@ -279,6 +360,20 @@ static int render_photo_to_fbs(const album_photo_t* p)
              * letterbox blit (CPU read of the same addresses) would be stale. */
             DCache_Invalidate((u32) s_lb_scratch, fw * fh * 4u);
         }
+        else if (s_fit_mode == FIT_LETTERBOX)
+        {
+            /* >3× even aspect-fitted — try cover so the photo does not vanish. */
+            RTK_LOGW(TAG, "src %dx%d unfit for letterbox -> try cover\n",
+                     (int) srcW, (int) srcH);
+            mode = FIT_COVER;
+        }
+        else
+        {
+            /* Already degraded from cover — neither mode can show it. */
+            RTK_LOGE(TAG, "src %dx%d >3x, cannot display\n",
+                     (int) srcW, (int) srcH);
+            return 0;
+        }
     }
 
     for (int i = 0; i < 2; i++)
@@ -286,7 +381,7 @@ static int render_photo_to_fbs(const album_photo_t* p)
         if (s_fb[i] == 0)
             continue;
 
-        if (s_fit_mode == FIT_LETTERBOX)
+        if (mode == FIT_LETTERBOX)
         {
             blit_centered_argb(s_fb[i], s_lb_scratch, fw, fh);
             ok++;
@@ -294,8 +389,8 @@ static int render_photo_to_fbs(const album_photo_t* p)
         }
 
         jpeg_dec_req_t req = {0};
-        req.jpeg_data  = p->data;
-        req.jpeg_len   = p->len;
+        req.jpeg_data  = data;
+        req.jpeg_len   = len;
         req.out_buffer = (void*) s_fb[i]; /* full-screen tight FB write */
         req.out_w      = PHOTO_W;
         req.out_h      = PHOTO_H;
@@ -318,12 +413,23 @@ static int render_photo_to_fbs(const album_photo_t* p)
     return ok;
 }
 
-/* Re-decode the current photo (used after a full-screen LVGL repaint). */
+/* Decode the current photo, whichever source it came from. */
 static void render_current_photo(void)
 {
-    const album_photo_t* p = album_photo_at(s_cur_index);
-    if (p != NULL)
-        render_photo_to_fbs(p);
+    uint32_t    len  = 0;
+    const char* name = NULL;
+    const uint8_t* data = photo_data(s_cur_index, &len, &name);
+    RTK_LOGI(TAG, "photo #%d [%s/%s] len=%u\n", s_cur_index,
+             s_use_sd ? "sd" : "flash", (name != NULL) ? name : "?",
+             (unsigned) len);
+    if (data != NULL && len > 0)
+    {
+        render_photo_stream(data, len);
+    }
+    else
+    {
+        RTK_LOGE(TAG, "photo #%d fetch failed\n", s_cur_index);
+    }
 }
 
 /* ========================================================================
@@ -361,6 +467,42 @@ static void autohide_timer_cb(lv_timer_t* timer)
         lv_tick_elaps(s_last_input_ms) >= ALBUM_BAR_AUTOHIDE_MS)
     {
         bar_hide();
+    }
+
+    /* SD card-detect poll at the bar auto-hide cadence (500 ms). */
+    album_sd_poll_result_t poll = album_sd_cd_poll();
+    if (poll == SD_POLL_INSERTED || poll == SD_POLL_REMOVED)
+    {
+        /* Either edge closes the recovery dialog and releases the held PP, so
+         * the screen is never left black. */
+        bool was_recovering = (s_recover_msgbox != NULL);
+        if (s_recover_msgbox != NULL)
+        {
+            lv_msgbox_close(s_recover_msgbox);
+            s_recover_msgbox = NULL;
+        }
+
+        bool had_sd = s_use_sd;
+        s_use_sd = (album_sd_count() > 0);
+        RTK_LOGI(TAG, "SD table changed (poll=0x%x) -> source %s (%d photos)\n",
+                 (int) poll, s_use_sd ? "SD" : "flash", photo_count());
+
+        if (s_use_sd != had_sd || was_recovering)
+        {
+            s_cur_index = 0; /* reset navigation to the new source's start */
+            if (photo_count() > 0)
+                album_show_photo(0);
+        }
+        info_bar_update();
+    }
+    else if (poll == SD_POLL_INSERT_FAILED)
+    {
+        /* Re-seated and still unreadable: stop the slideshow (PP goes back on
+         * hold with the dialog) and ask again. */
+        if (s_slideshow_on)
+            album_slideshow_toggle();
+        if (s_recover_msgbox == NULL)
+            show_sd_recover_dialog();
     }
 }
 
@@ -406,8 +548,12 @@ static void album_fit_mode_toggle(void)
 
 void album_show_photo(int index)
 {
-    int count = album_photo_count();
+    int count = photo_count();
     if (count <= 0)
+        return;
+
+    /* PP on hold: a full-screen decode would paint over the modal dialog. */
+    if (s_recover_msgbox != NULL)
         return;
 
     /* Wrap around */
@@ -415,19 +561,21 @@ void album_show_photo(int index)
     if (index < 0)
         index += count;
 
-    const album_photo_t* p = album_photo_at(index);
-    if (p == NULL || p->data == NULL || p->len == 0)
+    uint32_t    len  = 0;
+    const char* name = NULL;
+    const uint8_t* data = photo_data(index, &len, &name);
+    if (data == NULL || len == 0)
     {
         RTK_LOGE(TAG, "photo %d invalid\n", index);
         return;
     }
 
     RTK_LOGI(TAG, "show #%d '%s' (%d bytes)\n", index,
-             p->name ? p->name : "?", (int) p->len);
+             name ? name : "?", (int) len);
 
     s_cur_index = index;
 
-    if (render_photo_to_fbs(p) == 0)
+    if (render_photo_stream(data, len) == 0)
     {
         RTK_LOGE(TAG, "decode failed for #%d\n", index);
         info_bar_update();
@@ -600,10 +748,30 @@ static void input_event_cb(lv_event_t* e)
     {
         lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
         s_gesture_fired = true; /* disqualifies the armed long-press */
+
+        /* While the recovery dialog is up navigation would silently no-op
+         * behind it (album_show_photo() refuses to render), so swallow the
+         * gesture. */
+        if (s_recover_msgbox != NULL)
+            return;
+
+        /* With one photo, sideways swipes would only re-decode #0. */
+        bool swipe_switches = photo_count() > 1;
+
         switch (dir)
         {
-            case LV_DIR_LEFT:  album_next_photo(); break;
-            case LV_DIR_RIGHT: album_prev_photo(); break;
+            case LV_DIR_LEFT:
+                if (swipe_switches)
+                    album_next_photo();
+                else
+                    info_bar_update(); /* reflect same photo, no re-decode */
+                break;
+            case LV_DIR_RIGHT:
+                if (swipe_switches)
+                    album_prev_photo();
+                else
+                    info_bar_update();
+                break;
             case LV_DIR_TOP:
                 backlight_adjust(BL_STEP_PCT);
                 RTK_LOGI(TAG, "swipe UP -> brightness %d%%\n", backlight_get());
@@ -688,6 +856,56 @@ static void register_input_events(void)
     lv_indev_add_event_cb(indev, input_event_cb, LV_EVENT_LONG_PRESSED, NULL);
 }
 
+/* ---- SD-unreadable recovery dialog ----
+ * A card that stops answering commands cannot be recovered in software on this
+ * board (it is powered continuously), so ask for a physical re-plug or fall
+ * back to the flash album instead of retrying. */
+#define RECOVER_CHOICE_REPLUG   0
+#define RECOVER_CHOICE_FALLBACK 1
+
+static void recover_dialog_action_cb(lv_event_t* e)
+{
+    intptr_t choice = (intptr_t) lv_event_get_user_data(e);
+
+    if (s_recover_msgbox != NULL)
+    {
+        lv_msgbox_close(s_recover_msgbox);
+        s_recover_msgbox = NULL;
+    }
+
+    /* PP comes off hold as the dialog closes.  RE-PLUG keeps it up and waits
+     * for the remove→insert edge that mounts the card. */
+    if (choice == RECOVER_CHOICE_FALLBACK)
+    {
+        RTK_LOGI(TAG, "SD unreadable -> flash fallback\n");
+        if (photo_count() > 0)
+            album_show_photo(0);
+    }
+    else
+    {
+        RTK_LOGI(TAG, "SD unreadable -> waiting for re-plug\n");
+    }
+}
+
+static void show_sd_recover_dialog(void)
+{
+    lv_obj_t* mbox = lv_msgbox_create(NULL);
+    lv_msgbox_add_title(mbox, "SD card unreadable");
+    lv_msgbox_add_text(mbox,
+                       "Card detected but could not be read.\n"
+                       "Please re-plug the SD card, or use the built-in album.");
+
+    lv_obj_t* btn_replug = lv_msgbox_add_footer_button(mbox, "Re-plug SD");
+    lv_obj_add_event_cb(btn_replug, recover_dialog_action_cb, LV_EVENT_CLICKED,
+                        (void*) (intptr_t) RECOVER_CHOICE_REPLUG);
+
+    lv_obj_t* btn_flash = lv_msgbox_add_footer_button(mbox, "Flash Album");
+    lv_obj_add_event_cb(btn_flash, recover_dialog_action_cb, LV_EVENT_CLICKED,
+                        (void*) (intptr_t) RECOVER_CHOICE_FALLBACK);
+
+    s_recover_msgbox = mbox;
+}
+
 /* ========================================================================
  * UI construction
  * ======================================================================== */
@@ -739,12 +957,37 @@ void album_ui_init(void)
     s_last_input_ms  = lv_tick_get();
     s_autohide_timer = lv_timer_create(autohide_timer_cb, 500, NULL);
 
-    /* Paint the black background first, then decode the first photo on top. */
+    /* ---- Photo source: SD first, flash table as fallback ----
+     * A card that mounts but yields no photos counts as unreadable, so the user
+     * gets the re-plug / flash choice either way. */
+    album_sd_result_t sd_res = album_sd_init();
+    if (sd_res == SD_RES_OK)
+    {
+        album_sd_scan();
+        s_use_sd = (album_sd_count() > 0);
+        RTK_LOGI(TAG, "photo source: %s (%d photos)\n",
+                 s_use_sd ? "SD card" : "flash (no SD photos)", photo_count());
+
+        if (!s_use_sd)
+            show_sd_recover_dialog();
+    }
+    else
+    {
+        s_use_sd = false;
+        RTK_LOGI(TAG, "photo source: flash C-array (SD %s)\n",
+                 sd_res == SD_RES_NO_CARD ? "no card" : "unreadable");
+
+        if (sd_res == SD_RES_UNREADABLE)
+            show_sd_recover_dialog();
+    }
+
     lv_refr_now(NULL);
 
-    if (album_photo_count() > 0)
+    /* PP stays on hold while the dialog is up; the album starts when the user
+     * picks fallback-flash or a later insert edge mounts the card. */
+    if (s_recover_msgbox == NULL && photo_count() > 0)
         album_show_photo(0);
 
     RTK_LOGI(TAG, "album UI ready: %d photos, full screen %dx%d, bar %dpx\n",
-             album_photo_count(), PHOTO_W, PHOTO_H, ALBUM_STATUSBAR_H);
+             photo_count(), PHOTO_W, PHOTO_H, ALBUM_STATUSBAR_H);
 }
