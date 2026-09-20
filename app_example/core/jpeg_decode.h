@@ -6,18 +6,19 @@
 /* ========================================================================
  * Hardware JPEG decoder wrapper (RTL8721F MJPEG + PP post-processor)
  *
- * Decodes a JPEG byte stream (stored in flash as a C array) and writes the
- * result as ARGB8888 straight into a caller-provided PSRAM buffer that is
- * also the LVGL canvas backing store.  The PP block crops-to-fill + scales
- * in hardware, so the output always fills the target rect without letterbox
- * bars and without distorting the aspect ratio.
+ * Decodes a JPEG byte stream (flash C array, or SD via a PSRAM staging
+ * buffer) and writes the result as ARGB8888 straight into a caller-provided
+ * PSRAM buffer that is also the LVGL canvas backing store.  The PP block
+ * crops-to-fill + scales in hardware, so the output always fills the target
+ * rect without letterbox bars and without distorting the aspect ratio.
+ * jpeg_data stays const for both sources.
  *
  * Reference: ameba-rtos/example/peripheral/raw/MJPEG/raw_combined_multi_function
  * ======================================================================== */
 
 typedef struct
 {
-    const uint8_t* jpeg_data; /* JPEG stream (flash-resident C array) */
+    const uint8_t* jpeg_data; /* JPEG stream, flash- or PSRAM-resident */
     uint32_t       jpeg_len;  /* stream length in bytes               */
 
     void*    out_buffer; /* destination FB base (PSRAM)                    */

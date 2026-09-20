@@ -297,6 +297,24 @@ int jpeg_decode_to_argb8888(const jpeg_dec_req_t* req)
                      (int) cfg.ppInCrop.originY);
         }
     }
+
+    /* 1:1 passthrough: force an identity crop so PP's crop pipeline always
+     * runs, at its 8-px alignment.  This was added against a JpegDecDecode -7
+     * on some 1:1 sources; testing the bundled photos later showed the -7
+     * tracks the stream's Huffman table family (and/or a short source height),
+     * not the 1:1 case.  Harmless, so it stays. */
+    if (outW == srcW && outH == srcH)
+    {
+        uint32_t cW = srcW & ~7u;
+        uint32_t cH = srcH & ~7u;
+        cfg.ppInCrop.enable  = 1;
+        cfg.ppInCrop.width   = cW;
+        cfg.ppInCrop.height  = cH;
+        cfg.ppInCrop.originX = 0;
+        cfg.ppInCrop.originY = 0;
+        RTK_LOGI(TAG, "1:1 passthrough -> identity crop %dx%d\n",
+                 (int) cW, (int) cH);
+    }
     /* FIT_STRETCH / FIT_CONTAIN: no crop — PP stretches to fill output rect */
 
     cfg.ppOutFrmBuffer.enable = 0; /* tight packed write (no PIP compositing) */

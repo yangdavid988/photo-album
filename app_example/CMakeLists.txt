@@ -20,6 +20,8 @@ ameba_list_append(private_sources
     core/jpeg_decode.c
     # ui/
     ui/album_ui.c
+    # storage/  (SD-card photo source over VFS + FatFS)
+    storage/album_sd.c
     # hal/
     hal/backlight_ctrl.c
     hal/lcd/lcd_drv.c hal/lcd/lcdc_core.c hal/lcd/t1720a_cfg.c
