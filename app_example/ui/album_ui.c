@@ -35,10 +35,12 @@
 #include "config/album_config.h"
 #include "config/threshold_config.h"  /* BL_STEP_PCT for brightness gestures */
 #include "core/jpeg_decode.h"
+#include "core/brightness_osd.h"        /* shared raw brightness OSD         */
 #include "assets/photos/album_photos.h" /* flash fallback album (builtin) */
 #include "storage/album_sd.h"            /* SD-card album (VFS+FatFS)      */
 #include "hal/backlight_ctrl.h"
 #include "hal/lcd/lcd_drv.h"
+#include "hal/touch/touch_gt911.h" /* 3-finger peek: keep chords off gestures */
 
 #include <stdio.h>  /* snprintf */
 #include <string.h> /* memcpy / memset (letterbox compositing) */
@@ -88,6 +90,11 @@ static uint32_t    s_last_input_ms  = 0;     /* bar auto-hide reference tick */
 static lv_obj_t* s_recover_msgbox = NULL;
 static void show_sd_recover_dialog(void); /* defined below the timers */
 
+/* Launcher coexistence: album input is gated while the launcher layer shows.
+ * Init = active (boot path: album_ui_init runs under the launcher, but the
+ * launcher gate is applied by launcher_ui_init after construction). */
+static bool s_input_active = true;
+
 /* Double-tap detection, ported from pc_dashboard touch_gesture.c: LVGL's
  * DOUBLE_CLICKED is only sent to the clicked object, never to the indev, so
  * an indev-level callback can never see it.  We detect the 2nd SHORT_CLICKED
@@ -111,13 +118,31 @@ static bool   s_gesture_fired  = false;
 static int16_t s_press_x       = 0;
 static int16_t s_press_y       = 0;
 
-/* Brightness OSD (ported from pc_dashboard gpio_control.c brightness_osd_show).
- * NOTE: unlike the dashboard's translucent panel we MUST stay OPAQUE here —
- * LVGL only owns its dirty rects over PP-owned photo pixels, so a partial
- * alpha would blend against the black screen bg, not the photo. */
-static lv_obj_t* s_osd       = NULL;
-static lv_obj_t* s_osd_bar   = NULL;
-static lv_obj_t* s_osd_label = NULL;
+/* Brightness OSD — raw alpha-blend over the FBs (NOT LVGL widgets).
+ *
+ * A translucent LVGL overlay cannot work here: in DIRECT mode LVGL
+ * initialises every dirty rect it repaints with the screen background
+ * (black), so a partial-alpha widget would blend against black — never the
+ * photo underneath.  The shared raw module (core/brightness_osd.c) reads
+ * the FB pixels it covers and blends a 40%-black pill over them, so the
+ * photo genuinely shows through at 60%.  Used identically by the MJPEG
+ * player (there LVGL is stopped; here it is merely idle over these rows).
+ *
+ *   pct >= 0  -> osd_paint() blends the pill into BOTH LCDC FBs, because
+ *                LVGL's page flips (info-bar autohide) mean either buffer can
+ *                be what the DMA is scanning — a single-FB pill would vanish
+ *                on flip.  The pill stays visible until osd_erase() writes
+ *                the photo back over it.
+ *   pct < 0   -> OSD hidden; the refr_ready_hook decodes the photo back
+ *                over the pill rect (scratch decode, same path as the
+ *                bar-hide erase).
+ *
+ * The 1.5 s hold is owned by the 500 ms autohide timer below (s_osd_until_ms)
+ * — no lv_anim, those run in the LVGL thread and would fight the raw
+ * FB write between LVGL frames. */
+#define OSD_HOLD_MS 1500 /* same as the MJPEG player */
+static int s_osd_pct      = -1;   /* -1 = hidden, else 0..100     */
+static uint32_t s_osd_until_ms = 0; /* monotonic deadline for the hold   */
 
 /* PP owes a photo re-decode: set when LVGL painted over PP-owned photo rows
  * (bar-hide erase).  The REFR_READY hook decodes the photo back into BOTH
@@ -215,12 +240,70 @@ static void refr_ready_hook(lv_event_t* e)
     if (s_photo_dirty && s_has_photo)
     {
         /* OSD is painted over the photo rows — a decode now would wipe it.
-         * Keep the flag; osd_hide_del() re-decodes once the OSD is gone. */
-        if (s_osd != NULL)
+         * Keep the flag; the OSD erase (osd_erase) re-decodes once gone. */
+        if (s_osd_pct >= 0)
             return;
         /* Recovery dialog up = PP held; re-decode later (flag stays set). */
         if (s_recover_msgbox != NULL)
             return;
+        render_current_photo();
+        s_photo_dirty = false;
+    }
+}
+
+/* ========================================================================
+ * Brightness OSD (raw) — paint the shared pill into the CURRENTLY scanned
+ * FB, and erase it by re-decoding the photo back over the pill rect.
+ * ======================================================================== */
+
+/* Blend the OSD into BOTH FBs.  Writing the scanned buffer alone would make
+ * the pill vanish on the next LVGL page-flip (the other FB has no pill), so
+ * paint both — DMA shows whichever it scans.  A 180x44 write (~8k px) is far
+ * inside a 60 Hz frame; a mid-frame tear is at most one scanline of the bar
+ * edge on the scanned buffer. */
+static void osd_paint(int pct)
+{
+    if (pct < 0)
+        pct = 0;
+    if (pct > 100)
+        pct = 100;
+
+    int drawn = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        if (s_fb[i] == 0)
+            continue;
+        brightness_osd_draw(s_fb[i], PHOTO_W, PHOTO_H, pct);
+        drawn++;
+
+        /* Push only the pill rows to PSRAM so the DMA scan-out sees the blend
+         * on each buffer.  (A full-FB clean would also work; a 44-row clean
+         * keeps the CPU out of the photo rows.) */
+        const int ox = brightness_osd_x(PHOTO_W);
+        const int oy = brightness_osd_y(PHOTO_H);
+        DCache_Clean(s_fb[i] + (uint32_t) oy * (uint32_t) PHOTO_W * 4u
+                     + (uint32_t) ox * 4u,
+                     (uint32_t) PHOTO_W * BRIGHTNESS_OSD_PANEL_H * 4u);
+    }
+    if (drawn == 0)
+        return; /* FBs not configured yet */
+
+    s_osd_pct      = pct;
+    s_osd_until_ms = lv_tick_get() + OSD_HOLD_MS;
+}
+
+/* Clear the OSD: the FB now holds a 40%-blend over the photo rows.  Re-decode
+ * the photo INTO BOTH FBs (the standard album path) so the pill disappears —
+ * this is cheap (one JPEG decode, same as a photo flip) and restores true
+ * photo pixels in both buffers, not just the scanned one. */
+static void osd_erase(void)
+{
+    if (s_osd_pct < 0)
+        return;
+    s_osd_pct = -1;
+    s_osd_until_ms = 0;
+    if (s_has_photo)
+    {
         render_current_photo();
         s_photo_dirty = false;
     }
@@ -403,12 +486,11 @@ static int render_photo_stream(const uint8_t* data, uint32_t len)
     }
 
     /* PP just overwrote the bar rows in both FBs — if the bar is visible,
-     * hand its rect back to LVGL so the next frame repaints it.  Same for
-     * the transient brightness OSD (slideshow advance can land mid-OSD). */
+     * hand its rect back to LVGL so the next frame repaints it.  (The raw
+     * brightness OSD is blended into the FB and dies with this re-decode —
+     * osd_paint()'s pct is cleared by the caller, who knows a decode landed.) */
     if (ok > 0 && s_bar_visible && s_info_bar != NULL)
         lv_obj_invalidate(s_info_bar);
-    if (ok > 0 && s_osd != NULL)
-        lv_obj_invalidate(s_osd);
 
     return ok;
 }
@@ -430,6 +512,10 @@ static void render_current_photo(void)
     {
         RTK_LOGE(TAG, "photo #%d fetch failed\n", s_cur_index);
     }
+    /* A full-FB decode overwrote any raw OSD blend (fit toggle, bar erase,
+     * slideshow advance all land here) — drop the pending erase. */
+    s_osd_pct      = -1;
+    s_osd_until_ms = 0;
 }
 
 /* ========================================================================
@@ -463,6 +549,45 @@ static void bar_show(void)
 static void autohide_timer_cb(lv_timer_t* timer)
 {
     LV_UNUSED(timer);
+
+    /* Brightness OSD auto-dismiss: after OSD_HOLD_MS, re-decode the photo
+     * back over the blend.  Only while the album owns the screen — erasing
+     * under the launcher would paint the photo over the launcher's OPAQUE
+     * background (the launcher fill covers the OSD anyway, so dropping the
+     * pct bookkeeping is enough there). */
+    if (s_osd_pct >= 0 && lv_tick_elaps(s_osd_until_ms) >= OSD_HOLD_MS)
+    {
+        if (s_input_active)
+            osd_erase();
+        else
+            s_osd_pct = -1; /* launcher fill already covered it */
+    }
+
+    /* Launcher gate: while the launcher owns the screen the album must not
+     * re-render the photo (bar_hide() sets s_photo_dirty → a REFR_READY hook
+     * would PP-decode the photo back over the launcher's OPAQUE background).
+     * The SD card-detect poll below is kept — it only re-mounts on a real
+     * insert/remove edge and updates the album source; it never paints. */
+    if (!s_input_active)
+    {
+        album_sd_poll_result_t poll = album_sd_cd_poll();
+        if (poll == SD_POLL_INSERTED || poll == SD_POLL_REMOVED)
+        {
+            /* Keep the album table fresh while hidden, without painting. */
+            bool had_sd = s_use_sd;
+            s_use_sd = (album_sd_count() > 0);
+            RTK_LOGI(TAG, "SD table changed while launcher up (poll=0x%x) "
+                     "-> source %s (%d photos)\n",
+                     (int) poll, s_use_sd ? "SD" : "flash", photo_count());
+            if (s_use_sd != had_sd)
+            {
+                s_cur_index = 0;
+                info_bar_update();
+            }
+        }
+        return;
+    }
+
     if (s_bar_visible && s_has_photo &&
         lv_tick_elaps(s_last_input_ms) >= ALBUM_BAR_AUTOHIDE_MS)
     {
@@ -548,6 +673,12 @@ static void album_fit_mode_toggle(void)
 
 void album_show_photo(int index)
 {
+    /* A three-finger chord has priority over photo navigation.  A queued
+     * single-pointer swipe may reach this function before release latches the
+     * chord, so the driver peek covers both the armed press and the latch. */
+    if (touch_gt911_three_tap_peek())
+        return;
+
     int count = photo_count();
     if (count <= 0)
         return;
@@ -584,6 +715,12 @@ void album_show_photo(int index)
 
     s_has_photo   = true;
     s_photo_dirty = false; /* photo region is up to date in both FBs now */
+
+    /* The decode overwrote any raw OSD blend — drop the pending erase
+     * (the new photo is already clean in both FBs). */
+    s_osd_pct      = -1;
+    s_osd_until_ms = 0;
+
     /* Only the info-bar label changes → LVGL dirties just that strip. */
     info_bar_update();
 }
@@ -603,12 +740,53 @@ bool album_has_photo(void)
     return s_has_photo;
 }
 
+int album_ui_photo_count(void)
+{
+    return photo_count();
+}
+
+void album_ui_set_active(bool active)
+{
+    s_input_active = active;
+    if (!active)
+    {
+        /* Launcher on top: a pending photo re-decode (refr_ready_hook) must
+         * not fire while the launcher owns the screen — PP would repaint the
+         * photo back over the launcher's OPAQUE background.  Clearing the
+         * dirty flag is safe: entering the album always calls
+         * album_show_photo() which re-decodes. */
+        s_photo_dirty = false;
+        /* The launcher fill covers both FBs, so any blended OSD pill is gone
+         * without a decode — just drop the bookkeeping (an erase here would
+         * paint the photo over the launcher's OPAQUE background). */
+        s_osd_pct      = -1;
+        s_osd_until_ms = 0;
+    }
+    else
+    {
+        /* Back into the album.  This is NOT the place to decode a photo: the
+         * caller (goto_album) has already run album_show_photo(0/idx) to put
+         * the first frame on screen.  Just unlock input + reset the auto-hide
+         * reference; doing a decode here would repaint a photo DURING the
+         * launcher → album handoff (the same flash everyone saw at boot). */
+        s_last_input_ms = lv_tick_get();
+    }
+}
+
 /* ========================================================================
  * Slideshow
  * ======================================================================== */
 static void slideshow_timer_cb(lv_timer_t* timer)
 {
     LV_UNUSED(timer);
+
+    /* Launcher gate: don't advance photos while the launcher owns the screen
+     * (album_next_photo → PP re-decode would paint over the launcher's OPAQUE
+     * background).  s_slideshow_on stays set; playback resumes on the next
+     * tick once the user enters the album. */
+    if (!s_input_active)
+        return;
+
     album_next_photo();
 }
 
@@ -632,105 +810,33 @@ void album_slideshow_toggle(void)
 }
 
 /* ========================================================================
- * Brightness OSD — ported from pc_dashboard gpio_control.c
- * (brightness_osd_show / osd_fadein_cb / osd_fadeout_cb).  Differences:
- * OPAQUE bg (DIRECT-mode pixel ownership), and deleting it marks the photo
- * dirty because LVGL erases the vacated rect with the black screen bg.
+ * Brightness OSD — raw alpha-blend into the scanned FB (see the header
+ * comment on s_osd_pct).  osd_paint()/osd_erase() live by the REFR_READY
+ * hook above; the auto-hide deadline is served by the 500 ms autohide timer.
  * ======================================================================== */
-static void osd_fade_cb(void* var, int32_t v)
-{
-    lv_obj_set_style_opa((lv_obj_t*) var, (lv_opa_t) v, 0);
-}
-
-static void osd_close(void)
-{
-    if (s_osd == NULL)
-        return;
-    lv_anim_delete(s_osd, NULL);
-    lv_obj_delete(s_osd);
-    s_osd = NULL;
-    s_osd_bar = NULL;
-    s_osd_label = NULL;
-    /* LVGL will erase the OSD rect with the screen bg → PP rows lost. */
-    s_photo_dirty = true;
-}
-
-static void osd_fadeout_ready_cb(lv_anim_t* a)
-{
-    LV_UNUSED(a);
-    osd_close();
-}
-
-static void osd_show(int percent)
-{
-    if (s_osd == NULL)
-    {
-        lv_obj_t* scr = lv_scr_act();
-
-        s_osd = lv_obj_create(scr);
-        lv_obj_remove_style_all(s_osd);
-        lv_obj_set_size(s_osd, 180, 44);
-        lv_obj_align(s_osd, LV_ALIGN_BOTTOM_MID, 0, -12);
-        lv_obj_set_style_radius(s_osd, 22, 0);
-        lv_obj_set_style_bg_color(s_osd, lv_color_make(0x10, 0x10, 0x10), 0);
-        lv_obj_set_style_bg_opa(s_osd, LV_OPA_COVER, 0); /* OPAQUE, see note */
-        lv_obj_remove_flag(s_osd, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(s_osd, LV_OBJ_FLAG_CLICKABLE);
-
-        s_osd_label = lv_label_create(s_osd);
-        lv_obj_set_style_text_color(s_osd_label, lv_color_white(), 0);
-        lv_obj_set_style_text_font(s_osd_label, &lv_font_montserrat_14, 0);
-        lv_obj_align(s_osd_label, LV_ALIGN_LEFT_MID, 10, 0);
-
-        s_osd_bar = lv_bar_create(s_osd);
-        lv_obj_set_size(s_osd_bar, 90, 6);
-        lv_obj_align(s_osd_bar, LV_ALIGN_RIGHT_MID, -10, 0);
-        lv_bar_set_range(s_osd_bar, 0, 100);
-        lv_obj_set_style_anim_duration(s_osd_bar, 200, 0);
-        lv_obj_set_style_bg_color(s_osd_bar, lv_color_make(0x44, 0x44, 0x44), 0);
-        lv_obj_set_style_bg_color(s_osd_bar, lv_color_make(0xFF, 0xCC, 0x33),
-                                  LV_PART_INDICATOR);
-
-        /* Fade in (100 ms) */
-        lv_obj_set_style_opa(s_osd, LV_OPA_TRANSP, 0);
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, s_osd);
-        lv_anim_set_exec_cb(&a, osd_fade_cb);
-        lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
-        lv_anim_set_time(&a, 100);
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-        lv_anim_start(&a);
-    }
-    else
-    {
-        lv_anim_delete(s_osd, NULL); /* repeated swipe: restart fade-out */
-        lv_obj_set_style_opa(s_osd, LV_OPA_COVER, 0);
-    }
-
-    lv_label_set_text_fmt(s_osd_label, "%d %%", (int) percent);
-    lv_bar_set_value(s_osd_bar, percent, LV_ANIM_ON);
-
-    /* Auto fade-out (300 ms) after 1.5 s idle */
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_osd);
-    lv_anim_set_exec_cb(&a, osd_fade_cb);
-    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_time(&a, 300);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
-    lv_anim_set_delay(&a, 1500);
-    lv_anim_set_ready_cb(&a, osd_fadeout_ready_cb);
-    lv_anim_start(&a);
-}
 
 /* ========================================================================
  * Gesture / input handling (events on the INDEV, like pc_dashboard
  * touch_gesture.c — fires even when child widgets consume the press)
  * ======================================================================== */
+
 static void input_event_cb(lv_event_t* e)
 {
     lv_event_code_t code = lv_event_get_code(e);
+
+    /* Launcher gate: while the launcher layer is on top the album must not
+     * react to touches (its events live on the indev, so they fire even when
+     * the layer above swallows the object-level click).  See
+     * album_ui_set_active(). */
+    if (!s_input_active)
+        return;
+
+    /* Any 3-finger chord must never drive a photo navigation gesture here:
+     * LVGL only tracks one pointer, so a multi-finger swipe is fed to the
+     * indev as an ordinary swipe.  Let the launcher be the sole consumer.
+     * (Peek-only — don't clear, the launcher's poll consumes it.) */
+    if (touch_gt911_three_tap_peek())
+        return;
 
     /* Any contact keeps the info bar alive for another auto-hide period. */
     if (code == LV_EVENT_PRESSED)
@@ -775,12 +881,12 @@ static void input_event_cb(lv_event_t* e)
             case LV_DIR_TOP:
                 backlight_adjust(BL_STEP_PCT);
                 RTK_LOGI(TAG, "swipe UP -> brightness %d%%\n", backlight_get());
-                osd_show(backlight_get());
+                osd_paint(backlight_get());
                 break;
             case LV_DIR_BOTTOM:
                 backlight_adjust(-BL_STEP_PCT);
                 RTK_LOGI(TAG, "swipe DOWN -> brightness %d%%\n", backlight_get());
-                osd_show(backlight_get());
+                osd_paint(backlight_get());
                 break;
             default: break;
         }
@@ -981,12 +1087,13 @@ void album_ui_init(void)
             show_sd_recover_dialog();
     }
 
+    /* No photo decode at boot: the launcher is the boot screen, and decoding
+     * here flashed a photo through its OPAQUE background before the first
+     * launcher repaint.  goto_album() shows photo 0 on the first entry. */
     lv_refr_now(NULL);
 
     /* PP stays on hold while the dialog is up; the album starts when the user
      * picks fallback-flash or a later insert edge mounts the card. */
-    if (s_recover_msgbox == NULL && photo_count() > 0)
-        album_show_photo(0);
 
     RTK_LOGI(TAG, "album UI ready: %d photos, full screen %dx%d, bar %dpx\n",
              photo_count(), PHOTO_W, PHOTO_H, ALBUM_STATUSBAR_H);

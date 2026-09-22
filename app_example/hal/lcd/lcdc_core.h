@@ -123,4 +123,9 @@ uint32_t lcdc_core_get_pend_overwrite(void);
  * overwriting an unconsumed pending flip (which would drop a frame).        */
 bool lcdc_core_is_flip_pending(void);
 
+/* Returns the FB the LCDC DMA is currently scanning (bus address).  The MJPEG
+ * player decodes into the OTHER buffer and flips via flush_now(); this tells
+ * it which side is invisible right now.  0 until lcdc_core_init has run. */
+uint32_t lcdc_core_get_active_fb(void);
+
 #endif /* LCDC_CORE_H */

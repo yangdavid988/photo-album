@@ -83,6 +83,13 @@ static void (*volatile g_flip_done_cb)(void*) = NULL;
 /* Deferred flip_done_cb: LINE ISR sets this, FRD ISR consumes it */
 static void* volatile g_flip_done_deferred_ctx = NULL;
 
+/* FB the LCDC DMA is currently scanning.  Set whenever the DMA address
+ * changes (chain: FRD refresh, LINE pending flip).  NULL until first scan.
+ * The MJPEG player uses it to decode into the NON-scanned FB, then drives a
+ * lcdc_core_flush_now() refresh — the FRD ISR swaps the DMA pointer to that
+ * FB at the frame boundary.  A pure volatile word, shared with the ISR. */
+static volatile uint32_t g_active_fb = 0;
+
 /* ========================================================================
  * Debug counters
  * ======================================================================== */
@@ -187,7 +194,11 @@ static void lcdc_irq_handler(void)
             g_refresh = 0;
             LCDC_DMAImgCfg(LCDC, (u32) g_buffer);
             LCDC_ShadowReloadConfig(LCDC);
+            g_active_fb = (u32) g_buffer;
         }
+
+        /* (g_active_fb is set above whenever the DMA pointer moves — the
+         * MJPEG player reads it to know which FB it may safely decode into.) */
 
         /* Deferred flip_done_cb (DMA address set in LINE, effective after VBlank) */
         if (g_flip_done_deferred_ctx)
@@ -218,6 +229,7 @@ static void lcdc_irq_handler(void)
         {
             LCDC_DMAImgCfg(LCDC, g_pending_flip_fb);
             LCDC_ShadowReloadConfig(LCDC);
+            g_active_fb = g_pending_flip_fb;
 
             /* Flip counters + flush→flip latency (rtos_time_* is ISR-safe: uses xTaskGetTickCountFromISR) */
             {
@@ -322,6 +334,7 @@ static void lcdc_driver_init(const lcdc_screen_cfg_t* cfg)
         uint32_t _fb = lcdc_core_get_fb_base();
         LCDC_DMAImgCfg(LCDC, _fb + FB_BUF_SIZE);
         LCDC_ShadowReloadConfig(LCDC);
+        g_active_fb = _fb + FB_BUF_SIZE;
 
         memset((void*) _fb, 0, FB_BUF_SIZE * 2);
         DCache_Clean(_fb, FB_BUF_SIZE * 2);
@@ -456,9 +469,13 @@ void lcdc_core_mark_dirty(u32 off, u32 len)
     }
 }
 
-/** Force immediate DCache flush and trigger DMA update (non-VBlank path, for initial frame) */
+/** Force immediate DCache flush and trigger DMA update (non-VBlank path, for
+ * initial frame / MJPEG player).  g_refresh is consumed by the FRD ISR, which
+ * switches the DMA pointer to g_buffer — so g_buffer MUST track fb_addr here
+ * (a bare `g_refresh = 1` would re-scan the old buffer and never show fb_addr). */
 void lcdc_core_flush_now(uint32_t fb_addr)
 {
+    g_buffer  = (u8*) fb_addr;
     DCache_Clean(fb_addr, WIDTH * HEIGHT * 4);
     g_refresh = 1;
 }
@@ -554,4 +571,20 @@ uint32_t lcdc_core_get_pend_overwrite(void)
 bool lcdc_core_is_flip_pending(void)
 {
     return g_pending_flip_fb != 0;
+}
+
+/* ========================================================================
+ * MJPEG-player framebuffer ownership API
+ *
+ * The player drives the LCDC directly (LVGL is paused) with its own ping-pong
+ * and needs to know which FB the LCDC DMA is scanning so it decodes into the
+ * OTHER (invisible) buffer.  g_active_fb is maintained by the FRD/LINE ISRs
+ * whenever the DMA pointer moves — a pure volatile read for the player.
+ * ======================================================================== */
+
+uint32_t lcdc_core_get_active_fb(void)
+{
+    /* Initialised to the FB the driver first tells the LCDC to scan; may stay
+     * 0 if lcdc_core_init hasn't run yet. */
+    return g_active_fb;
 }

@@ -6,7 +6,8 @@
  */
 
 #include "config/album_config.h"
-#include "ui/album_ui.h"
+#include "ui/launcher_ui.h"
+#include "core/mjpeg_player.h"
 #include "hal/lcd/lcd_drv.h"
 #include "hal/lcd/lcdc_core.h"
 #ifdef CONFIG_SCREEN_T1720A
@@ -75,14 +76,24 @@ static void lvgl_main_thread(void* parameters)
     touch_gt911_init();
 #endif
 
-    /* Build the album UI */
-    album_ui_init();
+    /* Build the launcher UI (album + video router below it) */
+    launcher_ui_init();
 
-    RTK_LOGI(TAG, "Album UI ready, starting main loop...\n");
+    RTK_LOGI(TAG, "Launcher UI ready, starting main loop...\n");
 
     /* LVGL main loop */
     while (1)
     {
+        /* MJPEG playback owns the LCDC FBs + DMA: the player task decodes into
+         * the non-scanned FB and flips at the FRD boundary.  Standing the LVGL
+         * thread down here keeps lv_timer_handler() (and its flush_cb /
+         * record/commit flip path) from fighting the player for the FBs. */
+        if (mjpeg_player_is_active())
+        {
+            rtos_time_delay_ms(50);
+            continue;
+        }
+
         /* Frame gate: wait for previous frame's pending flip to be consumed
          * by LINE ISR before starting a new LVGL frame (see dashboard note). */
         while (lcdc_core_is_flip_pending())

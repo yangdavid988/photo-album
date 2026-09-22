@@ -70,6 +70,17 @@ static lv_indev_data_t   s_lvgl_touch_data = {
     .point = {0, 0}
 };
 
+/* Live touch-point count as the GT911 reports it (GSTID low nibble).  Used to
+ * detect the 3-finger tap chord.  Guarded by s_gt911.lock like ts->x/ts->y. */
+static int s_touch_count = 0;
+
+/* One-shot 3-finger-tap latch.  Whole press with ≥3 fingers followed by a
+ * whole release sets it.  touch_gt911_get_three_tap() clears it. */
+static bool s_three_tap_latched = false;
+
+/* Chord arm: a whole 3-finger press was seen and we await the release. */
+static bool s_three_tap_pressed = false;
+
 /* ---- I2C read/write helpers (identical to SDK) ---- */
 
 static int gt911_i2c_read(i2c_t *client, uint16_t reg, uint8_t *buf, int len)
@@ -255,6 +266,7 @@ static void gt911_process_touch_data(gt911_data_t *ts)
 err_finish:
     if (read[0] > 0)
     {
+        int nf = mode & 0x0F;               /* live touch-point count */
         uint8_t state = len > 0 ? 1 : 0;
         uint16_t x = (read[2] | (read[3] << 8));
         uint16_t y = (read[4] | (read[5] << 8));
@@ -283,13 +295,47 @@ err_finish:
             y = ts->y;
         }
 
+        /* Multi-finger chord tracker.  The GSTID count lets the driver notice
+         * a whole 3-finger press and release even though LVGL only follows one
+         * pointer.  Threshold "≥3" also swallows the brief 2-finger transition
+         * a third finger crossing the pad can produce.
+         *
+         * Latch on the count falling back to 0 — WITHOUT consulting LVGL's
+         * state.  LVGL tracks a single pointer; when three fingers are lifted
+         * the GT911 feed may still show what LVGL thinks is PRESSED until the
+         * INT-high path clears it, which would drop a perfectly good 3-finger
+         * tap.  s_three_tap_pressed is only set by a real rising edge
+         * (nf>=3 from <3), so a complete press→release here is a genuine
+         * chord; a "3→2" partial lift (finger dragged away, then the rest
+         * lifted) simply clears the arm without latching. */
+        if (nf != s_touch_count)
+        {
+            RTK_LOGS(LOG_TAG, RTK_LOG_DEBUG, "touch count %d -> %d\n",
+                     s_touch_count, nf);
+            if (nf >= 3 && s_touch_count < 3)
+            {
+                s_three_tap_pressed = true;
+            }
+            else if (nf == 0 && s_three_tap_pressed)
+            {
+                s_three_tap_latched = true;
+                s_three_tap_pressed = false;
+                RTK_LOGS(LOG_TAG, RTK_LOG_ALWAYS, "3-finger tap detected\n");
+            }
+            else if (nf == 0)
+            {
+                s_three_tap_pressed = false;
+            }
+            s_touch_count = nf;
+        }
+
         /* Feed into LVGL touch data */
         s_lvgl_touch_data.point.x = x;
         s_lvgl_touch_data.point.y = y;
         s_lvgl_touch_data.state   = state ? LV_INDEV_STATE_PRESSED
                                           : LV_INDEV_STATE_RELEASED;
 
-        RTK_LOGD(LOG_TAG, "x:%d y:%d state:%d\n", x, y, state);
+        RTK_LOGD(LOG_TAG, "x:%d y:%d state:%d nf:%d\n", x, y, state, nf);
     }
 
     rtos_mutex_give(ts->lock);
@@ -384,6 +430,38 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 /* ========================================================================
  * Public API
  * ======================================================================== */
+
+void touch_gt911_get_state(int32_t* x, int32_t* y, bool* down)
+{
+    if (x != NULL)
+        *x = s_lvgl_touch_data.point.x;
+    if (y != NULL)
+        *y = s_lvgl_touch_data.point.y;
+    if (down != NULL)
+        *down = (s_lvgl_touch_data.state == LV_INDEV_STATE_PRESSED);
+}
+
+bool touch_gt911_get_three_tap(void)
+{
+    /* rtos_queue_receive / mutex give happen elsewhere; the latch is set under
+     * the same driver lock in gt911_process_touch_data. */
+    rtos_mutex_take(s_gt911.lock, MUTEX_WAIT_TIMEOUT);
+    bool had = s_three_tap_latched;
+    s_three_tap_latched = false;
+    rtos_mutex_give(s_gt911.lock);
+    return had;
+}
+
+bool touch_gt911_three_tap_peek(void)
+{
+    /* Read-only — never clears.  Include the armed press, not just the
+     * post-release latch, so LVGL cannot emit a queued single-pointer swipe
+     * while the other fingers are still touching the panel. */
+    rtos_mutex_take(s_gt911.lock, MUTEX_WAIT_TIMEOUT);
+    bool active = s_three_tap_latched || s_three_tap_pressed;
+    rtos_mutex_give(s_gt911.lock);
+    return active;
+}
 
 void touch_gt911_init(void)
 {

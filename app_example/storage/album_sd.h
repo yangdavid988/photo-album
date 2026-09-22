@@ -72,4 +72,9 @@ const sd_photo_t* album_sd_at(int index);
 /* Display name of photo i, without file I/O.  NULL when out of range. */
 const char* album_sd_name(int index);
 
+/* The shared PSRAM stream buffer, reused by the MJPEG video source for its
+ * frame buffer.  Photo and video are exclusive modes, so neither ever holds a
+ * stream while the other reads one.  @param size out: buffer size (optional) */
+uint8_t* album_sd_stream_buffer(uint32_t* size);
+
 #endif /* ALBUM_SD_H */

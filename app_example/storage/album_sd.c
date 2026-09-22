@@ -45,6 +45,16 @@ extern SD_HdlTypeDef hsd0;
 __attribute__((section(".psram_heap.start"), aligned(64)))
 static uint8_t s_jpeg_buf[ALBUM_SD_BUF_SIZE];
 
+/* The MJPEG video source reads its frames into this same pool — photo and
+ * video playback are exclusive modes, so neither holds a stream while the
+ * other reads one. */
+uint8_t* album_sd_stream_buffer(uint32_t* size)
+{
+    if (size != NULL)
+        *size = (uint32_t) sizeof(s_jpeg_buf);
+    return s_jpeg_buf;
+}
+
 /* ---- Internal state ---- */
 static bool              s_mounted     = false;
 static bool              s_scanned     = false;
