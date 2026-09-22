@@ -28,4 +28,12 @@ void album_slideshow_toggle(void);
 /* True while the canvas holds a decoded photo (vs. placeholder text). */
 bool album_has_photo(void);
 
+/* Photo count of the source the album is currently using (SD or flash). */
+int album_ui_photo_count(void);
+
+/* Input gate for the launcher: the album's events are registered on the indev,
+ * so without this a tap on the launcher layer would still swipe photos behind
+ * it.  The launcher clears it when it shows and sets it when it hides. */
+void album_ui_set_active(bool active);
+
 #endif /* ALBUM_UI_H */

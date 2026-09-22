@@ -35,6 +35,186 @@ static bool g_jpeg_hw_ready = false;
 #define PP_OUT_PIX_FMT PP_PIX_FMT_RGB32
 #endif
 
+/* ========================================================================
+ * Persistent decode session (MJPEG playback)
+ *
+ * Reference: ameba-rtos/example/peripheral/raw/MJPEG/raw_combined_normal.c —
+ *   RCC + hx170dec_init once, JpegDecInit/PPInit/PPDecCombinedModeEnable once,
+ *   then per frame only PPGetConfig/PPSetConfig + JpegDecDecode, finishing with
+ *   PPDecCombinedModeDisable + PPRelease + JpegDecRelease.
+ *
+ * Each frame is a complete JPEG with its own SOI..EOI.  The PP output has no
+ * stride register, so 1:1 full-screen frames are written tightly into the
+ * caller's FB.  A frame's chroma format is re-probed per frame because MJPEG
+ * encoders may switch 4:2:0/4:2:2 between frames.
+ * ======================================================================== */
+static void jpeg_hw_power_on(void);
+static int  jpeg_pp_in_fmt(uint32_t jpeg_fmt);
+struct jpeg_session_s
+{
+    JpegDecInst  jpegInst;
+    PPInst       pp;
+    PPConfig     cfg;
+};
+
+jpeg_session_t jpeg_session_open(const jpeg_session_cfg_t* cfg)
+{
+    if (cfg == NULL || cfg->out_w == 0 || cfg->out_h == 0)
+        return NULL;
+
+    jpeg_hw_power_on();
+
+    jpeg_session_t s = (jpeg_session_t) rtos_mem_zmalloc(sizeof(*s));
+    if (s == NULL)
+    {
+        RTK_LOGE(TAG, "session alloc failed\n");
+        return NULL;
+    }
+
+    JpegDecRet jret = JpegDecInit(&s->jpegInst);
+    if (jret != JPEGDEC_OK)
+    {
+        RTK_LOGE(TAG, "session JpegDecInit: %d\n", jret);
+        goto fail;
+    }
+
+    PPResult pret = PPInit(&s->pp);
+    if (pret != PP_OK)
+    {
+        RTK_LOGE(TAG, "session PPInit: %d\n", pret);
+        goto fail;
+    }
+
+    pret = PPDecCombinedModeEnable(s->pp, s->jpegInst, PP_PIPELINED_DEC_TYPE_JPEG);
+    if (pret != PP_OK)
+    {
+        RTK_LOGE(TAG, "session PPDecCombinedModeEnable: %d\n", pret);
+        goto fail;
+    }
+
+    pret = PPGetConfig(s->pp, &s->cfg);
+    if (pret != PP_OK)
+    {
+        RTK_LOGE(TAG, "session PPGetConfig: %d\n", pret);
+        goto fail;
+    }
+
+    _memset(&s->cfg.ppInCrop, 0, sizeof(s->cfg.ppInCrop));
+    s->cfg.ppInCrop.enable = 0;
+    s->cfg.ppInRotation.rotation = PP_ROTATION_NONE;
+    s->cfg.ppInImg.videoRange = 1;
+    s->cfg.ppOutRgb.rgbTransform = PP_YCBCR2RGB_TRANSFORM_BT_709;
+    /* Output format is single-sourced by PP_OUT_PIX_FMT (see ppapi.h) — the
+     * session API deliberately doesn't expose it: the raw_combined lookups
+     * expect RGB32, and exposing ppapi.h enums here would leak HW types into
+     * the config struct. */
+    s->cfg.ppOutImg.pixFormat = PP_OUT_PIX_FMT;
+    s->cfg.ppOutImg.width = cfg->out_w;
+    s->cfg.ppOutImg.height = cfg->out_h;
+    s->cfg.ppOutFrmBuffer.enable = 0;  /* tight packed write, no PIP */
+    s->cfg.ppOutMask1.enable = 0;
+    s->cfg.ppOutMask2.enable = 0;
+
+    /* Output alignment (ppinternal.c PPCheckAllWidth/HeightParams):
+     * width % 8 == 0, height % 2 == 0, address % 8 bytes. */
+    if ((cfg->out_w & 7u) || (cfg->out_h & 1u))
+    {
+        RTK_LOGE(TAG, "session output %dx%d not PP-aligned (w%%8, h%%2)\n",
+                 (int) cfg->out_w, (int) cfg->out_h);
+        goto fail;
+    }
+
+    return s;
+
+fail:
+    if (s->pp != NULL)
+        PPRelease(s->pp);
+    if (s->jpegInst != NULL)
+        JpegDecRelease(s->jpegInst);
+    rtos_mem_free(s);
+    return NULL;
+}
+
+int jpeg_session_decode_frame(jpeg_session_t s,
+                              const uint8_t* jpeg_data, uint32_t jpeg_len,
+                              uint32_t out_fb)
+{
+    JpegDecInput  jpegIn;
+    JpegDecOutput jpegOut;
+    JpegDecImageInfo imgInfo;
+
+    if (s == NULL || jpeg_data == NULL || jpeg_len == 0 || out_fb == 0)
+        return -1;
+
+    _memset(&jpegIn,  0, sizeof(jpegIn));
+    _memset(&jpegOut, 0, sizeof(jpegOut));
+    _memset(&imgInfo, 0, sizeof(imgInfo));
+
+    jpegIn.streamBuffer.pVirtualAddress = (u32*) jpeg_data;
+    jpegIn.streamBuffer.busAddress      = (u32) jpeg_data;
+    jpegIn.streamLength                 = jpeg_len;
+    jpegIn.bufferSize                   = 0; /* whole frame supplied at once */
+
+    /* Probe this frame's chroma format + source size. */
+    JpegDecRet jret = JpegDecGetImageInfo(s->jpegInst, &jpegIn, &imgInfo);
+    if (jret != JPEGDEC_OK)
+    {
+        RTK_LOGE(TAG, "frame GetImageInfo: %d\n", jret);
+        return -1;
+    }
+
+    int inFmt = jpeg_pp_in_fmt(imgInfo.outputFormat);
+    if (inFmt < 0)
+    {
+        RTK_LOGE(TAG, "frame unsupported chroma 0x%x\n",
+                 (unsigned int) imgInfo.outputFormat);
+        return -1;
+    }
+
+    /* Frame may differ in dims/chroma per-frame in MJPEG; keep input config in
+     * sync (output stays fixed to the session FG size).  Scribbling into the
+     * session's cfg is fine — it is only re-sent via PPSetConfig each frame. */
+    memset(&s->cfg.ppInCrop, 0, sizeof(s->cfg.ppInCrop));
+    s->cfg.ppInCrop.enable = 0;
+    s->cfg.ppInImg.width   = imgInfo.outputWidth;
+    s->cfg.ppInImg.height  = imgInfo.outputHeight;
+    s->cfg.ppInImg.pixFormat = (u32) inFmt;
+
+    s->cfg.ppOutImg.bufferBusAddr = out_fb;
+
+    PPResult pret = PPSetConfig(s->pp, &s->cfg);
+    if (pret != PP_OK)
+    {
+        RTK_LOGE(TAG, "frame PPSetConfig: %d\n", pret);
+        return -1;
+    }
+
+    jret = JpegDecDecode(s->jpegInst, &jpegIn, &jpegOut);
+    if (jret != JPEGDEC_FRAME_READY)
+    {
+        RTK_LOGE(TAG, "frame JpegDecDecode: %d\n", jret);
+        return -1;
+    }
+
+    /* PP wrote via DMA; CPU DCache lines for the new buffer are stale. */
+    DCache_Invalidate(out_fb, s->cfg.ppOutImg.width * s->cfg.ppOutImg.height * 4u);
+    return 0;
+}
+
+void jpeg_session_close(jpeg_session_t s)
+{
+    if (s == NULL)
+        return;
+    if (s->pp != NULL)
+    {
+        PPDecCombinedModeDisable(s->pp, s->jpegInst);
+        PPRelease(s->pp);
+    }
+    if (s->jpegInst != NULL)
+        JpegDecRelease(s->jpegInst);
+    rtos_mem_free(s);
+}
+
 static void jpeg_hw_power_on(void)
 {
     if (g_jpeg_hw_ready)
