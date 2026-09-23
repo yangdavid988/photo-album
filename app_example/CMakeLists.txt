@@ -19,7 +19,7 @@ ameba_list_append(private_sources
     # core/
     core/jpeg_decode.c core/mjpeg_player.c core/brightness_osd.c
     # ui/
-    ui/album_ui.c ui/launcher_ui.c
+    ui/album_ui.c ui/launcher_ui.c ui/mjpeg_picker_ui.c
     # storage/  (SD-card photo + video sources over VFS + FatFS)
     storage/album_sd.c storage/album_sd_video.c
     # hal/

@@ -17,6 +17,7 @@
 #include "hal/lcd/lcd_drv.h" /* lcd_get_fb_base — launcher FB fill */
 #include "hal/touch/touch_gt911.h"
 #include "ui/album_ui.h"
+#include "ui/mjpeg_picker_ui.h"
 #include "assets/icons/icons.h" /* A8 icons — generated, tinted here */
 
 #include <stdio.h> /* snprintf */
@@ -51,6 +52,11 @@ static int s_mode = 0; /* 0 launcher / 1 album / 2 video */
 #define MODE_VIDEO    2
 
 static void launcher_alert(const char* title, const char* msg);
+
+/* Picker callbacks (defined below with the picker glue) — forward decls so
+ * picker_show in the glue block can reference them before their definition. */
+static void picker_on_pick(int index, void* udata);
+static void picker_on_back(void* udata);
 
 /* ========================================================================
  * Card construction
@@ -229,6 +235,36 @@ static void launcher_alert(const char* title, const char* msg)
     s_alert_msgbox = mbox;
 }
 
+/* ---- MJPEG picker glue (multi-video selection) ---- */
+
+/* Show the picker over the launcher.  The layer is OPAQUE, so it covers the
+ * launcher; its cards call back into picker_on_pick / picker_on_back. */
+static void picker_show(void)
+{
+    int n = mjpeg_video_count();
+    if (n <= 0)
+        return;
+    mjpeg_picker_show(n, picker_on_pick, picker_on_back, NULL);
+}
+
+/* Pick callback from the picker: hide the picker, then play the chosen video.
+ * The picker layer is already gone by the time playback starts, so goto_video's
+ * FB cover fill is safe. */
+static void picker_on_pick(int index, void* udata)
+{
+    LV_UNUSED(udata);
+    mjpeg_picker_hide();
+    goto_video(index);
+}
+
+/* Back callback: hide the picker and re-show the launcher. */
+static void picker_on_back(void* udata)
+{
+    LV_UNUSED(udata);
+    mjpeg_picker_hide();
+    launcher_show(); /* re-assert the launcher over the picker's FB bg */
+}
+
 /* ---- Card callbacks ---- */
 static void card_jpg_cb(lv_event_t* e)
 {
@@ -249,14 +285,18 @@ static void card_mjpeg_cb(lv_event_t* e)
     if (n <= 0)
     {
         launcher_alert("MJPEG Video",
-                       "No video folders on the SD card.\n"
-                       "Copy a folder of numbered JPG frames\n"
-                       "to the SD root.");
+                       "No video folders under /MJPEG on the SD card.\n"
+                       "Copy folders of numbered JPG frames there.");
         return;
     }
 
-    /* Single video → play it directly.  Multiple → play the first (a picker
-     * can replace this later; the demo ships one video folder). */
+    /* n > 1 → a selection layer.  Single video → play it directly. */
+    if (n > 1)
+    {
+        picker_show();
+        return;
+    }
+
     goto_video(0);
 }
 

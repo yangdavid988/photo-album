@@ -21,8 +21,10 @@
 #define MJPEG_PLAY_FPS 30
 #endif
 
-/* Cap on video folders found in the SD root. */
-#define MJPEG_MAX_VIDEOS 8
+/* Cap on video folders found in the SD root.  Mirrors the storage-layer
+ * SDV_MAX_VIDEOS; the picker shows these across multiple pages (4-per-row
+ * grid).  Bump in sync if it ever grows past a page count that fits. */
+#define MJPEG_MAX_VIDEOS 24
 
 /* Scan the SD card for video folders (wraps album_sd_scan_videos).
  * @return number of videos found; 0 when none / no card. */
