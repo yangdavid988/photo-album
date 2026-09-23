@@ -36,6 +36,9 @@
 #include "config/threshold_config.h"  /* BL_STEP_PCT for brightness gestures */
 #include "core/jpeg_decode.h"
 #include "core/brightness_osd.h"        /* shared raw brightness OSD         */
+#include "ui/launcher_ui.h"             /* launcher_enter_album — "Flash Album" */
+#include "core/mjpeg_player.h"          /* mjpeg_scan_videos — keep the video
+                                         * list in step with the SD photo table  */
 #include "assets/photos/album_photos.h" /* flash fallback album (builtin) */
 #include "storage/album_sd.h"            /* SD-card album (VFS+FatFS)      */
 #include "hal/backlight_ctrl.h"
@@ -89,6 +92,10 @@ static uint32_t    s_last_input_ms  = 0;     /* bar auto-hide reference tick */
 /* SD-unreadable recovery dialog.  NULL when not shown.  One at a time. */
 static lv_obj_t* s_recover_msgbox = NULL;
 static void show_sd_recover_dialog(void); /* defined below the timers */
+
+/* SD-removed notice (one-shot toast on card pull-out).  NULL when not shown. */
+static lv_obj_t* s_removed_msgbox = NULL;
+static void show_sd_removed_notice(void); /* defined below the timers */
 
 /* Launcher coexistence: album input is gated while the launcher layer shows.
  * Init = active (boot path: album_ui_init runs under the launcher, but the
@@ -571,7 +578,7 @@ static void autohide_timer_cb(lv_timer_t* timer)
     if (!s_input_active)
     {
         album_sd_poll_result_t poll = album_sd_cd_poll();
-        if (poll == SD_POLL_INSERTED || poll == SD_POLL_REMOVED)
+        if (poll != SD_POLL_NONE)
         {
             /* Keep the album table fresh while hidden, without painting. */
             bool had_sd = s_use_sd;
@@ -584,6 +591,12 @@ static void autohide_timer_cb(lv_timer_t* timer)
                 s_cur_index = 0;
                 info_bar_update();
             }
+            /* Video list: a mount/unmount edge changed what MJPEG folders the
+             * card holds.  mjpeg_scan_videos() guards on album_sd_mounted()
+             * (insert → new card listing; remove/failed → clears the stale
+             * list).  Re-sync keeps the launcher's video subtitle and the
+             * picker's pool in step with the photo table. */
+            mjpeg_scan_videos();
         }
         return;
     }
@@ -596,6 +609,16 @@ static void autohide_timer_cb(lv_timer_t* timer)
 
     /* SD card-detect poll at the bar auto-hide cadence (500 ms). */
     album_sd_poll_result_t poll = album_sd_cd_poll();
+
+    /* Card physically pulled out while we were using the SD source — show a
+     * brief notice so the user knows the SD album dropped and the flash album
+     * took over.  Gated on s_use_sd: a false CD glitch with nothing mounted
+     * produces no misleading toast. */
+    if (poll == SD_POLL_REMOVED && s_use_sd && s_removed_msgbox == NULL)
+    {
+        show_sd_removed_notice();
+    }
+
     if (poll == SD_POLL_INSERTED || poll == SD_POLL_REMOVED)
     {
         /* Either edge closes the recovery dialog and releases the held PP, so
@@ -629,6 +652,16 @@ static void autohide_timer_cb(lv_timer_t* timer)
         if (s_recover_msgbox == NULL)
             show_sd_recover_dialog();
     }
+
+    /* MJPEG video list — kept in step with the SD photo table on every SD
+     * edge (insert → new card's video folders; removed / insert-failed →
+     * album_sd_mounted() guard returns 0, clearing the video cache).  One
+     * reconcile call, mounted or not.  Gated on an actual transition: an idle
+     * poll (SD_POLL_NONE) must not re-enumerate the card twice a second.
+     * Runs on the lvgl thread like the rest of the timer, so the launcher's
+     * video subtitle refreshes without waiting for a launcher revisit. */
+    if (poll != SD_POLL_NONE)
+        mjpeg_scan_videos();
 }
 
 /* Double-tap feedback — lv_anim mechanism ported from pc_dashboard's
@@ -983,9 +1016,12 @@ static void recover_dialog_action_cb(lv_event_t* e)
      * for the remove→insert edge that mounts the card. */
     if (choice == RECOVER_CHOICE_FALLBACK)
     {
-        RTK_LOGI(TAG, "SD unreadable -> flash fallback\n");
-        if (photo_count() > 0)
-            album_show_photo(0);
+        RTK_LOGI(TAG, "SD unreadable -> flash fallback, entering album\n");
+        /* Hand the screen straight to the album: launcher_enter_album() hides
+         * the launcher FIRST, then decodes photo 0.  The old direct
+         * album_show_photo(0) here decoded under the still-visible OPAQUE
+         * launcher — one frame flashed and LVGL repainted the launcher over it. */
+        launcher_enter_album();
     }
     else
     {
@@ -995,11 +1031,16 @@ static void recover_dialog_action_cb(lv_event_t* e)
 
 static void show_sd_recover_dialog(void)
 {
+    /* Wording is deliberately generic — this dialog fires for every unusable-SD
+     * outcome (card absent / edge latched / unreadable / no media folders), and
+     * a stale CD edge can trip it with no card present at all.  All cases
+     * resolve the same way, so it just asks the user to check the card or use
+     * the flash album. */
     lv_obj_t* mbox = lv_msgbox_create(NULL);
-    lv_msgbox_add_title(mbox, "SD card unreadable");
+    lv_msgbox_add_title(mbox, "SD card unavailable");
     lv_msgbox_add_text(mbox,
-                       "Card detected but could not be read.\n"
-                       "Please re-plug the SD card, or use the built-in album.");
+                       "No usable SD card was found.\n"
+                       "Check the card, or use the built-in album.");
 
     lv_obj_t* btn_replug = lv_msgbox_add_footer_button(mbox, "Re-plug SD");
     lv_obj_add_event_cb(btn_replug, recover_dialog_action_cb, LV_EVENT_CLICKED,
@@ -1010,6 +1051,54 @@ static void show_sd_recover_dialog(void)
                         (void*) (intptr_t) RECOVER_CHOICE_FALLBACK);
 
     s_recover_msgbox = mbox;
+}
+
+/* ---- SD-removed notice (card pulled out) ----
+ * A lightweight, non-modal toast: tells the user the SD source dropped and the
+ * device is now showing the flash album.  Auto-dismisses after a short delay; a
+ * tap closes it too.  Deliberately NOT the recover dialog — that one is modal
+ * and asks for re-plug/fallback, but for a removal there is nothing to decide. */
+#define SD_REMOVED_NOTICE_MS 3000
+
+static void removed_notice_close(lv_event_t* e)
+{
+    LV_UNUSED(e);
+    if (s_removed_msgbox != NULL)
+    {
+        lv_msgbox_close(s_removed_msgbox);
+        s_removed_msgbox = NULL;
+    }
+}
+
+static void removed_notice_auto_close(lv_timer_t* t)
+{
+    LV_UNUSED(t);
+    removed_notice_close(NULL);
+}
+
+static void show_sd_removed_notice(void)
+{
+    if (s_removed_msgbox != NULL)
+        return; /* already showing one — don't stack */
+
+    lv_obj_t* mbox = lv_msgbox_create(NULL);
+    lv_msgbox_add_title(mbox, "SD card removed");
+    lv_msgbox_add_text(mbox,
+                       "SD source disconnected.\n"
+                       "Showing the built-in album.");
+
+    lv_obj_t* btn_ok = lv_msgbox_add_footer_button(mbox, "OK");
+    lv_obj_add_event_cb(btn_ok, removed_notice_close, LV_EVENT_CLICKED, NULL);
+
+    /* Tap anywhere on the box closes it too. */
+    lv_obj_add_event_cb(mbox, removed_notice_close, LV_EVENT_CLICKED, NULL);
+
+    s_removed_msgbox = mbox;
+
+    /* Auto-dismiss.  A one-shot timer; recreating on each new toast is fine. */
+    lv_timer_t* t = lv_timer_create(removed_notice_auto_close,
+                                    SD_REMOVED_NOTICE_MS, NULL);
+    lv_timer_set_repeat_count(t, 1);
 }
 
 /* ========================================================================
@@ -1074,7 +1163,11 @@ void album_ui_init(void)
         RTK_LOGI(TAG, "photo source: %s (%d photos)\n",
                  s_use_sd ? "SD card" : "flash (no SD photos)", photo_count());
 
-        if (!s_use_sd)
+        /* Card present + mounted but the media-folder structure (JPG/ or
+         * MJPEG/) is missing — a card the device can't use, not an unreadable
+         * one.  Ask the user to re-plug/fall back.  An SD that mounts with an
+         * EMPTY JPG/ folder is NOT unreadable: no prompt (flash fallback). */
+        if (!s_use_sd && !album_sd_has_media_folders())
             show_sd_recover_dialog();
     }
     else
