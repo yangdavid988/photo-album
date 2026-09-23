@@ -1,10 +1,12 @@
 /*
  * album_sd_video.c — SD-card MJPEG clip source (VFS + FatFS)
  *
- * Lists the card root for folders of numbered JPEG frames (album_sd_scan_videos)
- * and serves one frame at a time (album_sd_video_frame).  Frame order comes from
- * the number in each 8.3 name, never from readdir order, which would put
- * frame_2 after frame_10.
+ * Walks the SD card MJPEG/ directory for video folders (album_sd_scan_videos)
+ * and serves one frame at a time (album_sd_video_frame).  A "video" is a
+ * sub-folder holding sequentially-numbered baseline JPEG frames; the scan is
+ * single-level — every direct child of MJPEG/ is a candidate, a child without
+ * numbered JPEG frames is skipped.  Frame order comes from the number in each
+ * 8.3 name, never from readdir order, which would put frame_2 after frame_10.
  */
 #include "album_sd_video.h"
 
@@ -23,8 +25,9 @@
 #endif
 
 /* ---- Tunables ---- */
-#define SDV_MAX_VIDEOS     8  /* cap the root video-folder listing       */
-#define SDV_MAX_FRAMES     1024 /* cap frames per video */
+#define SDV_MAX_VIDEOS     24  /* cap the MJPEG/ sub-folder listing      */
+#define SDV_MAX_FRAMES     1024 /* cap frames per video                  */
+#define SDV_MJPEG_DIR      "MJPEG" /* video folders live under this dir  */
 
 /* Shared PSRAM stream buffer holding ONE JPEG frame at a time.  Reuses the
  * photo path's 2 MB pool (album_sd_stream_buffer) — photo and video playback
@@ -33,9 +36,10 @@
 static uint8_t* s_frame_buf   = NULL;
 static uint32_t s_frame_bufsz = 0;
 
-/* Per-video prepared state: sorted frame file names (8.3 SHORT names as the
- * VFS hands them out).  Only one video is prepared at a time. */
-static char s_frame_names[SDV_MAX_FRAMES][16];
+/* Per-video prepared state: sorted frame file names.  Only one video is
+ * prepared at a time.  64 bytes per name covers LFN stems like
+ * "frame_000001.jpg". */
+static char s_frame_names[SDV_MAX_FRAMES][64];
 static int  s_prepared = 0; /* frame count of the prepared video */
 static char s_prep_path[160]; /* full "vol:folder/" of the prepared video */
 
@@ -71,7 +75,7 @@ static void frame_sort(void)
         }
         if (best != i)
         {
-            char tmp[16];
+            char tmp[64];
             memcpy(tmp, s_frame_names[i], sizeof(tmp));
             memcpy(s_frame_names[i], s_frame_names[best], sizeof(tmp));
             memcpy(s_frame_names[best], tmp, sizeof(tmp));
@@ -119,30 +123,47 @@ int album_sd_scan_videos(sd_video_t* list, int max)
         return 0;
     }
 
+    /* Two-pass scan.  A single loop that peeks each sub-folder (a nested
+     * opendir/readdir) from inside the root readdir loop stops after the first
+     * folder on long LFN names.  Collect the MJPEG/ sub-folder names first
+     * (pass 1), then peek each one after the root iterator is closed (pass 2). */
     char root[VFS_PATH_MAX];
-    snprintf(root, sizeof(root), "%s:", prefix);
+    snprintf(root, sizeof(root), "%s:%s/", prefix, SDV_MJPEG_DIR);
+
+    /* Long names (LFN): a sub-folder name can exceed 8.3. */
+    char sub[SDV_MAX_VIDEOS][64];
+    int  nsub = 0;
 
     void* dir = opendir(root);
     if (dir == NULL)
     {
-        RTK_LOGE(TAG, "video scan: opendir(\"%s\") failed\n", root);
+        RTK_LOGI(TAG, "video scan: opendir(\"%s\") failed (no MJPEG dir?)\n", root);
         return 0;
     }
 
     struct dirent* ent;
-    while ((ent = readdir(dir)) != NULL && nv < max)
+    while ((ent = readdir(dir)) != NULL && nsub < SDV_MAX_VIDEOS)
     {
         if (ent->d_type != DT_DIR)
             continue; /* a video is a folder only */
-
         const char* nm = ent->d_name;
         if (nm[0] == '.' || strcmp(nm, "System Volume Information") == 0)
             continue;
+        snprintf(sub[nsub], sizeof(sub[0]), "%s", nm);
+        nsub++;
+    }
+    closedir(dir);
 
-        sd_video_t* v = &list[nv];
+    RTK_LOGI(TAG, "  pass 1: %d subfolder(s) under %s\n", nsub, root);
+
+    /* Pass 2: peek each collected sub-folder for numbered JPEG frames. */
+    for (int i = 0; i < nsub && nv < max; i++)
+    {
+        const char* nm = sub[i];
+        sd_video_t* v  = &list[nv];
         memset(v, 0, sizeof(*v));
 
-        if (snprintf(v->path, sizeof(v->path), "%s:%s/", prefix, nm) >=
+        if (snprintf(v->path, sizeof(v->path), "%s%s/", root, nm) >=
             (int) sizeof(v->path))
         {
             RTK_LOGI(TAG, "  [skip] %-24s (path too long)\n", nm);
@@ -150,7 +171,6 @@ int album_sd_scan_videos(sd_video_t* list, int max)
         }
         snprintf(v->name, sizeof(v->name), "%s", nm);
 
-        /* Peek inside: does this folder hold numbered JPEG frames? */
         void* sdir = opendir(v->path);
         if (sdir == NULL)
         {
@@ -184,7 +204,6 @@ int album_sd_scan_videos(sd_video_t* list, int max)
         RTK_LOGI(TAG, "  [video] %-24s %d frames\n", v->name, v->frame_count);
         nv++;
     }
-    closedir(dir);
 
     RTK_LOGI(TAG, "SD video scan: %d videos\n", nv);
     return nv;
