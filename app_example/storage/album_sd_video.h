@@ -12,9 +12,11 @@
  * produces).  Frames are streamed one at a time into the photo source's PSRAM
  * buffer.
  *
- * Frame order comes from the number in each file name, never from readdir
- * order: the VFS hands out 8.3 short names.  Only the playing clip's names are
- * cached, so a frame lookup never re-enumerates the folder.
+ * Frame order is the folder's physical readdir order, which for sequentially
+ * written clips equals the ascending camera-counter order the decoder expects.
+ * Playback holds one open directory cursor and reads each frame off it with
+ * FatFS open-by-cursor, so a frame read is O(1) and never re-enumerates the
+ * folder.
  */
 
 typedef struct
@@ -29,12 +31,13 @@ typedef struct
  * none). */
 int album_sd_scan_videos(sd_video_t* list, int max);
 
-/* Cache one clip's frame names in playback order, up to SDV_MAX_FRAMES.
- * @return frames prepared (0 on error / not a clip). */
+/* Open the clip's directory cursor for frame streaming.  @return frames
+ * prepared (0 on error / not a clip).  Frees any previous cursor. */
 int album_sd_video_prepare(const sd_video_t* video);
 
-/* Read frame n (0-based, playback order) of the prepared clip into the shared
- * PSRAM buffer.  @return the JPEG stream, valid until the next call, or NULL. */
+/* Read frame n (0-based, stream order) of the prepared clip into the shared
+ * PSRAM buffer, advancing the cursor.  @return the JPEG stream, valid until the
+ * next call, or NULL. */
 const uint8_t* album_sd_video_frame(int n, uint32_t* len);
 
 #endif /* ALBUM_SD_VIDEO_H */
