@@ -13,4 +13,10 @@
  * display and touch indev creation. */
 void launcher_ui_init(void);
 
+/* Enter the JPG album directly: hide the launcher layer first, then decode
+ * photo #0, so the album really takes the screen.  Used by the album's
+ * SD-recovery "Flash Album" button.  Decoding while the OPAQUE launcher is
+ * still visible flashed one frame and LVGL repainted the launcher over it. */
+void launcher_enter_album(void);
+
 #endif /* LAUNCHER_UI_H */

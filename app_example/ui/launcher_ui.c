@@ -187,6 +187,21 @@ static void goto_album(void)
     RTK_LOGI(TAG, "-> JPG album\n");
 }
 
+/* Enter the JPG album straight from over the launcher (the SD-recovery
+ * dialog's "Flash Album" button).  Same order as goto_album: hide the OPAQUE
+ * launcher FIRST, then decode photo 0 — decoding first flashed one frame and
+ * LVGL repainted the launcher back over it. */
+void launcher_enter_album(void)
+{
+    if (album_ui_photo_count() <= 0)
+        return; /* empty album must not grab the screen */
+
+    launcher_hide();
+    s_mode = MODE_ALBUM;
+    album_show_photo(0);
+    RTK_LOGI(TAG, "-> JPG album (direct entry)\n");
+}
+
 static void goto_video(int index)
 {
     if (index < 0)
