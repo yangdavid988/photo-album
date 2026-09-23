@@ -199,22 +199,19 @@ album_sd_result_t album_sd_init(void)
         return SD_RES_UNREADABLE;
     }
 
+    /* Let FatFS judge the volume, not a raw LBA-0 probe: Windows-formatted
+     * cards ("FAT32, no partition") carry an MBR whose LBA 0 is a partition
+     * record, with the real FAT VBR behind it — FatFS's find_volume() walks
+     * the MBR, a hand-rolled 0xEB/0x55AA check rejects it.  Keep a transfer
+     * state check (above) for driver truth; the mount verdict is FatFS's. */
     SD_RESULT sdret = SD_ReadBlocks(0, s_jpeg_buf, 2);
-
-    /* Superfloppy FAT: boot sector at LBA 0 (0xEB/0xE9 jump + 0x55AA at 510).
-     * An MBR-partitioned card keeps its VBR behind the LBA-0 partition record
-     * and is rejected here. */
-    bool fat_ok = (sdret == SD_OK) &&
-                  (s_jpeg_buf[0] == 0xEB || s_jpeg_buf[0] == 0xE9) &&
-                  s_jpeg_buf[510] == 0x55 && s_jpeg_buf[511] == 0xAA;
-    if (!fat_ok)
+    if (sdret == SD_OK)
     {
-        RTK_LOGE(TAG, "sector0 not a FAT boot sector (ret=0x%x, jump=%02x, sig=%02x%02x)\n",
-                 (int) sdret, s_jpeg_buf[0],
+        RTK_LOGI(TAG, "raw sector0 (diag): %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x  sig=%02x%02x\n",
+                 s_jpeg_buf[0], s_jpeg_buf[1], s_jpeg_buf[2], s_jpeg_buf[3],
+                 s_jpeg_buf[4], s_jpeg_buf[5], s_jpeg_buf[6], s_jpeg_buf[7],
+                 s_jpeg_buf[8], s_jpeg_buf[9], s_jpeg_buf[10], s_jpeg_buf[11],
                  s_jpeg_buf[511], s_jpeg_buf[510]);
-        vfs_user_unregister("sdcard", VFS_FATFS, VFS_INF_SD);
-        s_last_result = SD_RES_UNREADABLE;
-        return SD_RES_UNREADABLE;
     }
 
     s_mounted = true;
@@ -394,11 +391,19 @@ album_sd_poll_result_t album_sd_cd_poll(void)
         if (s_count > 0)
             return SD_POLL_INSERTED;
 
-        /* Mounted but enumerated nothing — readable card, unusable content. */
-        RTK_LOGW(TAG, "SD mounted but 0 photos — treating as unreadable\n");
-        album_sd_unmount();
-        s_last_result = SD_RES_UNREADABLE;
-        return SD_POLL_INSERT_FAILED;
+        /* Mounted but the media-folder structure is missing — a readable card
+         * not meant for this device.  Re-offer recovery.  An EMPTY JPG/
+         * folder (media folders present) is NOT a failure: keep the card
+         * mounted, flash fallback handles the no-photo view. */
+        if (!album_sd_has_media_folders())
+        {
+            RTK_LOGW(TAG, "SD mounted but no JPG/MJPEG folder — treating as unusable\n");
+            album_sd_unmount();
+            s_last_result = SD_RES_UNREADABLE;
+            return SD_POLL_INSERT_FAILED;
+        }
+        RTK_LOGI(TAG, "SD mounted, media folders present (%d photos)\n", s_count);
+        return SD_POLL_INSERTED;
     }
 
     s_last_result = SD_RES_UNREADABLE;
@@ -410,6 +415,34 @@ album_sd_poll_result_t album_sd_cd_poll(void)
 int album_sd_count(void)
 {
     return s_count;
+}
+
+/* Existence test for the reload prompt: a card that mounts but lacks the JPG/
+ * (or MJPEG/) folder is not unreadable — it is simply not laid out for this
+ * device.  Either media folder present means the card is usable; an empty but
+ * present JPG/ must not fall through to "unreadable card". */
+bool album_sd_has_media_folders(void)
+{
+    if (!s_mounted)
+        return false;
+
+    char* prefix = find_vfs_tag(VFS_REGION_4);
+    if (prefix == NULL || prefix[0] == '\0')
+        return false;
+
+    static const char* const s_media_dirs[] = { ALBUM_SD_PHOTO_DIR, "MJPEG" };
+    for (unsigned i = 0; i < sizeof(s_media_dirs) / sizeof(s_media_dirs[0]); i++)
+    {
+        char path[VFS_PATH_MAX];
+        snprintf(path, sizeof(path), "%s:%s", prefix, s_media_dirs[i]);
+        void* d = opendir(path);
+        if (d != NULL)
+        {
+            closedir(d);
+            return true;
+        }
+    }
+    return false;
 }
 
 const char* album_sd_name(int index)
