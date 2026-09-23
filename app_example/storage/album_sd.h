@@ -65,6 +65,12 @@ album_sd_poll_result_t album_sd_cd_poll(void);
 /* Photo count from the last album_sd_scan(). */
 int  album_sd_count(void);
 
+/* True when the mounted card carries the media structure this device expects
+ * (a JPG/ and/or MJPEG/ folder under the volume root).  The real "card is
+ * usable" test for the reload prompt — not "did we find >0 photos", because a
+ * readable card may simply hold an empty JPG/ folder. */
+bool album_sd_has_media_folders(void);
+
 /* Photo i, loaded into the shared PSRAM buffer — decode it before requesting
  * another index.  NULL when out of range or the load failed. */
 const sd_photo_t* album_sd_at(int index);
