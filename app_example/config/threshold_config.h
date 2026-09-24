@@ -10,9 +10,6 @@
 /* Master enable: 0 = always 100 %, 1 = allow dimming */
 #define BRIGHTNESS_ENABLED 1
 
-/* Standby brightness (0..100) — T1720A quadratic curve */
-#define BRIGHTNESS_STANDBY_PCT 2
-
 /* Normal brightness (0..100) */
 #define BRIGHTNESS_NORMAL_PCT 100
 

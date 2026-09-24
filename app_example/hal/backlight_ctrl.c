@@ -3,14 +3,6 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/*
- * ameba_soc.h MUST come before backlight_ctrl.h:
- *   - ameba_soc.h → platform_autoconf.h → #define CONFIG_SCREEN_DBL070 (or not)
- *   - backlight_ctrl.h → threshold_config.h → #ifdef CONFIG_SCREEN_DBL070
- *   If we included backlight_ctrl.h first, CONFIG_SCREEN_DBL070 would still be
- *   undefined when threshold_config.h is processed, causing BRIGHTNESS_STANDBY_PCT
- *   and BL_MIN_PCT to fall through to the ST7262 defaults regardless of Kconfig.
- */
 #include "ameba_soc.h"
 #include "hal/backlight_ctrl.h"
 #include "config/threshold_config.h"
@@ -23,14 +15,10 @@
 #endif
 
 /* ========================================================================
- * Backlight brightness control — raw register PWM (both platforms)
+ * Backlight brightness control — raw register PWM (T1720A only)
  *
  * Uses TIM4 channel 0 with direct register access to drive the backlight
- * MOSFET gate.
- *
- * Pin assignment:
- *   DBL070 (ST7277)  backlight on _PC_1
- *   ST7262           backlight on _PB_3  (_PA_17 is DISP, not backlight)
+ * MOSFET gate.  Backlight pin is _PA_25.
  *
  * Timer: ~1 kHz PWM via TIM4, zero CPU overhead (hardware output).
  *
@@ -68,117 +56,23 @@
 
 static bool    g_bl_initialized = false;
 static int     g_user_pct       = 100; /* user-space brightness (with remap applied internally) */
-static int     g_restore_pct    = 100; /* brightness saved before entering standby */
 static PinName g_bl_pin;               /* backlight PinName (for pinmux) */
 static u32     g_bl_gpio_pin;          /* backlight GPIO pin number (for GPIO ops) */
-
-/* ---- Gradual fade state (duty-domain linear) ---- */
-static bool     g_fade_pending   = false; /* true during the initial delay */
-static bool     g_fade_active    = false; /* true while fade is in progress */
-static int      g_fade_start_pct = 100;   /* brightness (%) when fade began */
-static int      g_fade_target    = 3;     /* target brightness (%) */
-static uint32_t g_fade_start_ms  = 0;     /* timestamp when pending/active began */
-#define BL_FADE_INIT_DELAY_MS 2100        /* delay before first step (sweep ~2s) */
-#define BL_FADE_DURATION_MS   8000        /* total fade time (ms), duty changes linearly */
 
 /*
  * Brightness remap: user_percent(0..100) -> actual PWM duty(0.0 .. 1.0)
  *
- * Panel-specific curves — each backlight circuit has different
- * voltage-to-brightness transfer characteristics.
- *
- * DBL070 (ST7277): MOSFET gate RC filter.  The MOSFET saturates above
- *   ~3-5 % PWM duty, so low-end needs fine resolution.  Cubic spreads
- *   the sensitive low-PWM region across more user steps:
- *     user  10 -> duty 0.1 %   (just visible)
- *     user  30 -> duty 2.7 %   (near saturation)
- *     user 100 -> duty 100 %
- *
- * ST7262: backlight driven directly by PWM, no MOSFET saturation.
- *   Quadratic provides a gentler roll-off than cubic, giving usable
- *   output at low user-percentages without being too abrupt:
- *     user  20 -> duty 4.0 %   (dim but visible)
- *     user  50 -> duty 25 %
- *     user 100 -> duty 100 %
- *
- * T1720A: shares ST7262-like quadratic behavior (no MOSFET saturation,
- *   direct PWM drive).  Same remap as ST7262.
+ * T1720A backlight is driven directly by PWM, no MOSFET saturation, so a
+ * quadratic curve gives a gentle low-end roll-off:
+ *   user  20 -> duty 4.0 %
+ *   user  50 -> duty 25 %
+ *   user 100 -> duty 100 %
  */
 static float backlight_remap(int user_pct)
 {
-#ifdef CONFIG_SCREEN_DBL070
-    float x = (float) user_pct / 100.0f;
-    return x * x * x; /* cubic — MOSFET saturation compensation */
-#else
-    /* ST7262 and T1720A */
     float x = (float) user_pct / 100.0f;
     return x * x; /* quadratic — gentle low-end, no MOSFET */
-#endif
 }
-
-#if defined(CONFIG_SCREEN_ST7262) || defined(CONFIG_SCREEN_T1720A)
-/*
- * Square root (ST7262 inverse remap).
- * Newton-Raphson iteration, no math.h needed.
- */
-static float _sqrt(float x)
-{
-    if (x <= 0.0f)
-        return 0.0f;
-    if (x >= 1.0f)
-        return 1.0f;
-
-    /* Scale x to [0.25, 1) for fast convergence */
-    float scale = 1.0f;
-    while (x < 0.25f)
-    {
-        x *= 4.0f;
-        scale *= 0.5f;
-    }
-
-    float y = x;
-    for (int i = 0; i < 4; i++)
-        y = (y + x / y) * 0.5f;
-
-    return y * scale;
-}
-#endif /* CONFIG_SCREEN_ST7262 or CONFIG_SCREEN_T1720A */
-
-#ifdef CONFIG_SCREEN_DBL070
-/*
- * Cube root (DBL070 inverse remap).
- * Newton-Raphson iteration, no math.h needed.
- */
-static float _cbrt(float x)
-{
-    if (x <= 0.0f)
-        return 0.0f;
-    if (x >= 1.0f)
-        return 1.0f;
-
-    /*
-     * Scale x into [0.125, 1) where Newton-Raphson converges
-     * reliably.  Each x8 corresponds to /2 in the result.
-     *
-     * Without scaling, small inputs (e.g. x = 0.008) start from
-     * y = x = 0.008 which is ~25x away from the true root 0.2;
-     * the first iteration overshoots to ~41 and subsequent steps
-     * crawl back toward zero instead of the correct answer.
-     */
-    float scale = 1.0f;
-    while (x < 0.125f)
-    {
-        x *= 8.0f;
-        scale *= 0.5f;
-    }
-
-    float y = x;
-    for (int i = 0; i < 7; i++)
-        y = (2.0f * y + x / (y * y)) / 3.0f;
-
-    return y * scale;
-}
-#endif /* CONFIG_SCREEN_DBL070 */
 
 /* ========================================================================
  * Public API
@@ -189,34 +83,12 @@ void backlight_init(void)
     if (g_bl_initialized)
         return;
 
-    PinName bl_pin =
-#ifdef CONFIG_SCREEN_DBL070
-        PC_1;
-#elif defined(CONFIG_SCREEN_ST7262)
-        PB_3; /* _PA_17 is DISP, not backlight */
-#elif defined(CONFIG_SCREEN_T1720A)
-        PA_25;
-#endif
+    /* T1720A backlight pin — used for both the PWM pinmux and the 0 % GPIO
+     * drive-down path. */
+    g_bl_pin      = PA_25;
+    g_bl_gpio_pin = (u32) _PA_25;
 
-    g_bl_pin      = bl_pin;
-    g_bl_gpio_pin =
-#ifdef CONFIG_SCREEN_DBL070
-        (u32) _PC_1;
-#elif defined(CONFIG_SCREEN_ST7262)
-        (u32) _PB_3;
-#elif defined(CONFIG_SCREEN_T1720A)
-        (u32) _PA_25;
-#endif
-
-    RTK_LOGI(TAG, "backlight_init: raw PWM on %s\n",
-#ifdef CONFIG_SCREEN_DBL070
-             "_PC_1"
-#elif defined(CONFIG_SCREEN_ST7262)
-             "_PB_3"
-#elif defined(CONFIG_SCREEN_T1720A)
-             "_PA_25"
-#endif
-             );
+    RTK_LOGI(TAG, "backlight_init: raw PWM on _PA_25\n");
 
     /* ---- 1. Enable TIM4 peripheral clock ---- */
     RCC_PeriphClockCmd(APBPeriph_TIMx[BL_TIMER_IDX],
@@ -255,7 +127,7 @@ void backlight_init(void)
     RTIM_CCxCmd(TIMx[BL_TIMER_IDX], BL_PWM_CHAN, TIM_CCx_Enable);
 
     /* ---- 5. Route pin to TIM4 PWM function ---- */
-    Pinmux_Config(bl_pin, PINMUX_FUNCTION_TIM4_PWM0);
+    Pinmux_Config(g_bl_pin, PINMUX_FUNCTION_TIM4_PWM0);
 
     /* ---- 6. Start timer LAST (counter begins after channel is fully set up) ---- */
     RTIM_Cmd(TIMx[BL_TIMER_IDX], ENABLE);
@@ -269,109 +141,7 @@ void backlight_init(void)
      */
     backlight_set((int) BRIGHTNESS_NORMAL_PCT);
 
-    RTK_LOGI(TAG, "backlight_init: done (PSC=%d ARR=%d en=%d normal=%d%% standby=%d%%)\n", BL_PRESCALER, BL_ARR, (int) BRIGHTNESS_ENABLED, (int) BRIGHTNESS_NORMAL_PCT, (int) BRIGHTNESS_STANDBY_PCT);
-}
-
-void backlight_set_standby(bool active)
-{
-    if (!BRIGHTNESS_ENABLED)
-    {
-        RTK_LOGI(TAG, "backlight_set_standby(%d) ignored (disabled)\n", (int) active);
-        return;
-    }
-
-    if (active)
-    {
-        /*
-         * Entering standby: record brightness, defer fade start.
-         * The actual fade begins after BL_FADE_INIT_DELAY_MS (~2 s)
-         * to let the clock sweep animation complete without FPS
-         * interference.  The fade then ramps duty linearly over
-         * BL_FADE_DURATION_MS for a smooth, step-less transition.
-         *
-         * g_fade_start_pct mirrors the current brightness so the fade
-         * transitions smoothly from the monitor level down to the standby
-         * threshold — no "brighten then dim" glitch.  g_restore_pct
-         * preserves the pre-standby brightness for restore on unlock.
-         */
-        g_restore_pct    = g_user_pct;
-        g_fade_start_pct = g_user_pct;
-        g_fade_target    = (int) BRIGHTNESS_STANDBY_PCT;
-        g_fade_pending   = (g_fade_start_pct != g_fade_target);
-        g_fade_active    = false;
-        g_fade_start_ms  = rtos_time_get_current_system_time_ms();
-
-        RTK_LOGI(TAG, "backlight_set_standby(1) -> fade %d%% -> %d%% (delay %d ms)\n", g_fade_start_pct, g_fade_target, BL_FADE_INIT_DELAY_MS);
-    }
-    else
-    {
-        /*
-         * Exiting standby: stop any active fade immediately,
-         * restore the pre-standby brightness.
-         */
-        g_fade_pending = false;
-        g_fade_active  = false;
-        backlight_set(g_restore_pct);
-
-        RTK_LOGI(TAG, "backlight_set_standby(0) -> restore %d%%\n", g_restore_pct);
-    }
-}
-
-void backlight_fade_tick(void)
-{
-    uint32_t now = rtos_time_get_current_system_time_ms();
-
-    /* ---- Pending: initial delay before fade begins ---- */
-    if (g_fade_pending)
-    {
-        if ((now - g_fade_start_ms) >= BL_FADE_INIT_DELAY_MS)
-        {
-            /* Start the actual fade: reset timer for duty progression */
-            g_fade_pending  = false;
-            g_fade_active   = true;
-            g_fade_start_ms = now;
-            RTK_LOGI(TAG, "backlight_fade: start (cur=%d%% tgt=%d%% dur=%d ms)\n", g_fade_start_pct, g_fade_target, BL_FADE_DURATION_MS);
-        }
-        return;
-    }
-
-    if (!g_fade_active)
-        return;
-
-    /* ---- Active: duty-domain linear progression ---- *
-     * Compute elapsed fraction of total duration, then
-     * linearly interpolate in the duty domain for a smooth
-     * step-less visual transition.                        */
-    uint32_t elapsed    = now - g_fade_start_ms;
-    float    t          = (float) elapsed / (float) BL_FADE_DURATION_MS;
-    float    start_duty = backlight_remap(g_fade_start_pct);
-    float    end_duty   = backlight_remap(g_fade_target);
-    float    duty;
-
-    if (t >= 1.0f)
-    {
-        backlight_set(g_fade_target);
-        g_fade_active = false;
-        RTK_LOGI(TAG, "backlight_fade: done (%d%%)\n", g_fade_target);
-        return;
-    }
-
-    duty = start_duty + (end_duty - start_duty) * t;
-
-    /* Inverse remap: duty -> user percentage */
-    int user_pct;
-#if defined(CONFIG_SCREEN_DBL070)
-    user_pct = (int) (_cbrt(duty) * 100.0f + 0.5f);
-#else
-    /* ST7262 and T1720A: quadratic inverse = sqrt */
-    user_pct = (int) (_sqrt(duty) * 100.0f + 0.5f);
-#endif
-    if (user_pct > 100)
-        user_pct = 100;
-    if (user_pct < 0)
-        user_pct = 0;
-
-    backlight_set(user_pct);
+    RTK_LOGI(TAG, "backlight_init: done (PSC=%d ARR=%d en=%d normal=%d%%)\n", BL_PRESCALER, BL_ARR, (int) BRIGHTNESS_ENABLED, (int) BRIGHTNESS_NORMAL_PCT);
 }
 
 void backlight_set(int percent)

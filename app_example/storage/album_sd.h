@@ -16,6 +16,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Media sub-folder names on the SD card volume root.  Single source of truth
+ * shared by the photo module (album_sd.c), the video module (album_sd_video.c)
+ * and the has-media-folders probe — rename here, never as a literal. */
+#define ALBUM_SD_PHOTO_DIR "JPG"
+#define ALBUM_SD_MJPEG_DIR "MJPEG"
+
 /* Same shape as album_photo_t in album_photos.h. */
 typedef struct
 {

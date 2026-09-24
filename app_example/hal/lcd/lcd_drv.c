@@ -1,19 +1,11 @@
 #include "lcd_drv.h"
 
 /* ========================================================================
- * Screen selection: compile-time switch via #ifdef CONFIG_SCREEN_xxx
- * Each screen provides one lcdc_screen_cfg_t configuration table
+ * Screen selection — this demo is T1720A only (GT911 touch + PASSIVE
+ * backlight).  DBL070 / ST7262 are not supported.
  * ======================================================================== */
-#ifdef CONFIG_SCREEN_T1720A
 #include "t1720a_cfg.h"
 #define SCREEN_CFG (&g_t1720a_cfg)
-#elif defined(CONFIG_SCREEN_DBL070)
-#include "dbl070_cfg.h"
-#define SCREEN_CFG (&g_dbl070_cfg)
-#elif defined(CONFIG_SCREEN_ST7262)
-#include "st7262_cfg.h"
-#define SCREEN_CFG (&g_st7262_cfg)
-#endif
 
 /* ========================================================================
  * Unified interface implementation
@@ -31,11 +23,6 @@ void lcd_init(void)
 void lcd_get_info(int* width, int* height)
 {
     lcdc_core_get_info(width, height);
-}
-
-void lcd_flush_buffer(uint8_t* buffer)
-{
-    lcdc_core_flush_buffer(buffer);
 }
 
 void lcd_get_fb_base(uint32_t* base1, uint32_t* base2)

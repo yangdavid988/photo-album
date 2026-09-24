@@ -49,14 +49,8 @@ uint32_t lcdc_core_get_fb_base(void)
 /* ========================================================================
  * Internal state
  * ======================================================================== */
-static const lcdc_screen_cfg_t* g_cfg     = NULL;
 static volatile u8*             g_buffer  = NULL;
 static volatile int             g_refresh = 0;
-
-/* VBlank sync: accumulate dirty region, flush DCache during VBlank (eliminate tearing) */
-static volatile u32 g_dirty_start   = 0;
-static volatile u32 g_dirty_end     = 0;
-static volatile int g_dirty_pending = 0;
 
 static struct
 {
@@ -64,10 +58,6 @@ static struct
     u32 IrqData;
     u32 IrqPriority;
 } gLcdcIrqInfo;
-
-/* VBlank callback (direct function pointer, no struct wrapper needed) */
-static void (*volatile g_vblank_cb)(void*) = NULL;
-static void* volatile g_data               = NULL;
 
 /* Stage 1: recorded by flush_cb (DCache_Clean done, no pendig flip) */
 static volatile uint32_t g_pending_flush_fb = 0;
@@ -162,7 +152,7 @@ __attribute__((unused)) static void lcdc_debug_log(void)
  *
  * Interrupt | Purpose
  * ----------|-----------------------------------
- * FRD       | Monitoring + old path (single-buffer dirty region accumulation)
+ * FRD       | flush_now DMA handoff + flip_done dispatch
  * LINE      | ★ Double-buffer page flip (official recommended timing)
  * DMA_UN    | Underflow warning
  * ======================================================================== */
@@ -173,32 +163,23 @@ static void lcdc_irq_handler(void)
     IntId = LCDC_GetINTStatus(LCDC);
     LCDC_ClearINT(LCDC, IntId);
 
-    /* -- Frame end interrupt: counters + old path -- */
+    /* -- Frame end interrupt: counters + flush_now handoff -- */
     if (IntId & LCDC_BIT_LCD_FRD_INTS)
     {
         g_dbg.frd_count++;
         g_dbg.last_frd_tick = rtos_time_get_current_system_time_ms();
 
-        /* [Old path] Single buffer + dirty region accumulation */
-        if (g_dirty_pending || g_refresh)
+        /* Non-VBlank refresh request (lcdc_core_flush_now, used by the MJPEG
+         * player): switch the DMA pointer to the posted buffer at the frame
+         * boundary.  g_active_fb tracks the scanned FB so the player decodes
+         * into the OTHER buffer. */
+        if (g_refresh)
         {
-            if (g_dirty_pending)
-            {
-                u32 len = g_dirty_end - g_dirty_start;
-                if (len > 0)
-                {
-                    DCache_Clean(g_dirty_start, len);
-                }
-                g_dirty_pending = 0;
-            }
             g_refresh = 0;
             LCDC_DMAImgCfg(LCDC, (u32) g_buffer);
             LCDC_ShadowReloadConfig(LCDC);
             g_active_fb = (u32) g_buffer;
         }
-
-        /* (g_active_fb is set above whenever the DMA pointer moves — the
-         * MJPEG player reads it to know which FB it may safely decode into.) */
 
         /* Deferred flip_done_cb (DMA address set in LINE, effective after VBlank) */
         if (g_flip_done_deferred_ctx)
@@ -260,15 +241,6 @@ static void lcdc_irq_handler(void)
             g_flip_done_deferred_ctx = (void*) g_pending_context;
             g_pending_flip_fb        = 0;
             g_pending_context        = NULL;
-        }
-    }
-
-    /* VBlank notification (official SDK calls back at LINE position, not true VBlank) */
-    if (IntId & LCDC_BIT_LCD_LIN_INTEN)
-    {
-        if (g_vblank_cb)
-        {
-            g_vblank_cb(g_data);
         }
     }
 
@@ -356,10 +328,6 @@ static void lcdc_driver_init(const lcdc_screen_cfg_t* cfg)
 
 void lcdc_core_init(const lcdc_screen_cfg_t* cfg)
 {
-    g_cfg = cfg;
-    /* Use section-attribute allocated PSRAM base, not cfg->fb_base */
-    g_buffer = (u8*) lcdc_core_get_fb_base();
-
     cfg->pinmux_config();
 
     /* Backlight PWM init (after pinmux so GPIO is configured first) */
@@ -393,80 +361,12 @@ void lcdc_core_init(const lcdc_screen_cfg_t* cfg)
     LCDC_Cmd(LCDC, ENABLE);
 }
 
-void lcdc_core_flush_buffer(uint8_t* buffer)
-{
-    if (!g_cfg)
-        return;
-
-    switch (g_cfg->image_format)
-    {
-        case LDC_IMG_FMT_ARGB8888:
-            g_buffer = buffer;
-            DCache_Clean((u32) g_buffer, WIDTH * HEIGHT * 4);
-            break;
-        case LDC_IMG_FMT_RGB888:
-            g_buffer = buffer;
-            DCache_Clean((u32) g_buffer, WIDTH * HEIGHT * 3);
-            break;
-        default:
-            g_buffer = buffer;
-            DCache_Clean((u32) g_buffer, WIDTH * HEIGHT * 2);
-            break;
-    }
-    g_refresh = 1;
-}
-
 void lcdc_core_get_info(int* width, int* height)
 {
     if (width)
         *width = WIDTH;
     if (height)
         *height = HEIGHT;
-}
-
-void lcdc_core_register_vblank(void (*cb)(void*), void* user_data)
-{
-    g_vblank_cb = cb;
-    g_data      = user_data;
-}
-
-void lcdc_core_trigger_refresh(uint8_t* buffer)
-{
-    g_buffer  = buffer;
-    g_refresh = 1;
-}
-
-/** Mark dirty region, defer DCache flush to VBlank (eliminate tearing)
- *  off/len = byte offset within frame buffer
- *  Accumulate dirty region range, unified DCache_Clean + trigger refresh in VBlank ISR */
-void lcdc_core_mark_dirty(u32 off, u32 len)
-{
-    if (!g_cfg)
-        return;
-
-    u32 fb_size = (u32) WIDTH * HEIGHT * 4;
-    /* Clip len to ensure dirty range stays within frame buffer boundary, prevent DCache_Clean overflow */
-    if (off < fb_size)
-    {
-        if (off + len > fb_size)
-            len = fb_size - off;
-        u32 area_start = lcdc_core_get_fb_base() + off;
-        u32 area_end   = area_start + len;
-
-        if (!g_dirty_pending)
-        {
-            g_dirty_start   = area_start;
-            g_dirty_end     = area_end;
-            g_dirty_pending = 1;
-        }
-        else
-        {
-            if (area_start < g_dirty_start)
-                g_dirty_start = area_start;
-            if (area_end > g_dirty_end)
-                g_dirty_end = area_end;
-        }
-    }
 }
 
 /** Force immediate DCache flush and trigger DMA update (non-VBlank path, for

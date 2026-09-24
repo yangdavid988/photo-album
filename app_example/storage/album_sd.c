@@ -35,8 +35,8 @@ extern SD_HdlTypeDef hsd0;
 #define ALBUM_SD_MAX_PHOTOS 32 /* cap the JPG/ listing            */
 #define ALBUM_SD_NAME_LEN   64 /* display name (file stem) length */
 
-/* Photos live in this card folder, never on the bare card root. */
-#define ALBUM_SD_PHOTO_DIR "JPG"
+/* Photos live in ALBUM_SD_PHOTO_DIR (album_sd.h) — the name is shared with the
+ * video module's MJPEG dir probe. */
 
 /* PSRAM staging buffer for the CURRENT photo's JPEG stream; also the per-file
  * size cap enforced by probe_file().  .psram_heap.start is the section the
@@ -430,7 +430,7 @@ bool album_sd_has_media_folders(void)
     if (prefix == NULL || prefix[0] == '\0')
         return false;
 
-    static const char* const s_media_dirs[] = { ALBUM_SD_PHOTO_DIR, "MJPEG" };
+    static const char* const s_media_dirs[] = { ALBUM_SD_PHOTO_DIR, ALBUM_SD_MJPEG_DIR };
     for (unsigned i = 0; i < sizeof(s_media_dirs) / sizeof(s_media_dirs[0]); i++)
     {
         char path[VFS_PATH_MAX];
