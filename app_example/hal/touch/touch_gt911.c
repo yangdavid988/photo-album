@@ -416,9 +416,14 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void) indev;
 
+    /* The GT911 work task publishes s_lvgl_touch_data under s_gt911.lock;
+     * read it under the same lock so LVGL never sees a torn point
+     * (x from one report, y from the next). */
+    rtos_mutex_take(s_gt911.lock, MUTEX_WAIT_TIMEOUT);
     data->point.x = s_lvgl_touch_data.point.x;
     data->point.y = s_lvgl_touch_data.point.y;
     data->state   = s_lvgl_touch_data.state;
+    rtos_mutex_give(s_gt911.lock);
 
     if (data->state == LV_INDEV_STATE_PRESSED)
     {

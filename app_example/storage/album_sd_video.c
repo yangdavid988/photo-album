@@ -26,24 +26,21 @@
 #include "vfs_fatfs.h"
 #include "storage/album_sd.h" /* album_sd_mounted() for the mount gate */
 
-/* Open-by-cursor: old playback opened every frame by name
- * (f_open("vol:/video/00001441.jpg")).  FatFS's dir_find() walks the whole
- * directory from entry 0 on every open, so a multi-thousand-frame folder costs
- * O(N) SD sector reads per frame and read time degrades linearly with the frame
- * index.  Enumerating once and streaming from the live DIR cursor with
- * f_open_by_dir()/f_dir_next() skips path lookup entirely — O(1) per frame.
- * Stream order == directory physical order, which is safe because the frames
- * are written sequentially by ffmpeg/phone cameras.  No name table, no sort,
- * no per-frame path string. */
+/* Frame streaming uses FatFS open-by-cursor (f_open_by_dir / f_dir_next):
+ * the folder is walked once via a live DIR handle, so each frame is O(1) —
+ * no per-frame name open or directory re-scan (the old f_open-by-name path
+ * was O(N) sector reads per frame).  Stream order == directory physical
+ * (readdir) order, which for ffmpeg/phone-produced 000001.jpg … clips equals
+ * ascending camera-counter order.  No name table, no sort. */
 
 #ifndef TAG
 #define TAG "SD_VIDEO"
 #endif
 
 /* ---- Tunables ---- */
-#define SDV_MAX_VIDEOS 24    /* cap the MJPEG/ sub-folder listing      */
+#define SDV_MAX_VIDEOS 24    /* cap the MJPEG/ sub-folder listing */
 #define SDV_MAX_FRAMES 5120  /* max frames per video (6-digit counters) */
-#define SDV_MJPEG_DIR  "MJPEG" /* video folders live under this root dir */
+/* Video folders live under ALBUM_SD_MJPEG_DIR from album_sd.h (shared). */
 
 /* Shared PSRAM stream buffer holding ONE JPEG frame at a time.  Reuses the
  * photo path's 2 MB pool (album_sd_stream_buffer) — photo and video playback
@@ -122,7 +119,7 @@ int album_sd_scan_videos(sd_video_t* list, int max)
      * folder on long LFN names.  Collect the MJPEG/ sub-folder names first
      * (pass 1), then peek each one after the root iterator is closed (pass 2). */
     char root[VFS_PATH_MAX];
-    snprintf(root, sizeof(root), "%s:%s/", prefix, SDV_MJPEG_DIR);
+    snprintf(root, sizeof(root), "%s:%s/", prefix, ALBUM_SD_MJPEG_DIR);
 
     /* Long names (LFN): a sub-folder name can exceed 8.3. */
     char sub[SDV_MAX_VIDEOS][64];
@@ -260,17 +257,14 @@ const uint8_t* album_sd_video_frame(int n, uint32_t* len)
         return NULL;
     }
 
-    /* Open the entry the cursor currently sits on (O(1) — no dir_find path
-     * walk), read it, close it, then advance the cursor to the next entry.
-     * At the end of a pass the cursor sits on the EOT marker; when playback
-     * wraps (n back to 0) rewind the cursor so the pass restarts at frame 0. */
+    /* Stream straight off the live cursor: open the entry it sits on, read,
+     * close, advance.  When playback wraps (n back to 0) rewind the cursor to
+     * the first frame (f_rewinddir parks on '.', so skip it first). */
     DIR* dir = (DIR*) ((vfs_file*) s_dir)->file;
     FIL  fil;
 
     if (n == 0)
     {
-        /* f_rewinddir parks the cursor on the folder's first entry ('.') —
-         * skip past it to the first frame, mirroring the prepare() park. */
         f_rewinddir(dir);
         f_dir_next(dir);
     }
@@ -278,14 +272,14 @@ const uint8_t* album_sd_video_frame(int n, uint32_t* len)
     memset(&fil, 0, sizeof(fil));
     if (f_open_by_dir(&fil, dir) != FR_OK)
     {
+        /* Cursor not on an openable file ('.', sub-dir, EOT...) — skip ahead. */
         RTK_LOGW(TAG, "frame %d: open_by_dir skip\n", n);
         f_dir_next(dir);
         return NULL;
     }
 
-    /* Read the whole frame without seeking to EOF first: a seek-to-END on
-     * FatFS walks the file's full FAT cluster chain just to learn a size the
-     * open already knows.  Read straight to EOF, bounded by the shared buffer. */
+    /* Read straight to EOF bounded by the shared buffer; no seek-to-END (that
+     * would walk the full FAT cluster chain just to learn a size). */
     size_t total = 0;
     while (total < (size_t) s_frame_bufsz)
     {

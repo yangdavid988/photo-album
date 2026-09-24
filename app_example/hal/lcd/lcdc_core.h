@@ -50,25 +50,13 @@ typedef struct
 /* Initialize with screen configuration table */
 void lcdc_core_init(const lcdc_screen_cfg_t* cfg);
 
-/* Flush buffer (DCache_Clean + DMA trigger) */
-void lcdc_core_flush_buffer(uint8_t* buffer);
-
 /* Get resolution */
 void lcdc_core_get_info(int* width, int* height);
 
 /* Get PSRAM-section-allocated framebuffer base address */
 uint32_t lcdc_core_get_fb_base(void);
 
-/* Register VBlank callback */
-void lcdc_core_register_vblank(void (*cb)(void*), void* data);
-
-/* Set DMA buffer pointer + trigger refresh only (no DCache_Clean, caller's responsibility) */
-void lcdc_core_trigger_refresh(uint8_t* buffer);
-
-/* VBlank sync: mark dirty region, defer DCache flush to VBlank ISR (eliminates tearing) */
-void lcdc_core_mark_dirty(uint32_t off, uint32_t len);
-
-/* Force immediate DCache flush + DMA update (for initial frame) */
+/* Force immediate DCache flush + DMA update (for initial frame / MJPEG player) */
 void lcdc_core_flush_now(uint32_t fb_addr);
 
 /* ========================================================================

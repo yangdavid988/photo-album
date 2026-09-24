@@ -151,9 +151,10 @@ static void launcher_show(void)
     RTK_LOGI(TAG, "-> launcher\n");
 }
 
-/* End-of-playback handoff, run on the player task.  lv_refr_now() from a
- * foreign thread would race the main loop's flip logic, so this only sets a
- * flag; launcher_poll_cb does the actual show on the LVGL thread. */
+/* End-of-playback handoff, called from the player task.  Only flags the LVGL
+ * thread — the cross-thread refresh (see poll state comment: lv_refr_now from a
+ * foreign thread can wedge the display) must run on the LVGL thread via
+ * launcher_poll_cb. */
 static void launcher_show_pending(void)
 {
     s_video_end_pending = true;
@@ -209,9 +210,7 @@ static void goto_video(int index)
     launcher_hide();
     s_mode = MODE_VIDEO;
 
-    /* Both FBs are re-filled with the launcher colour: the album below was
-     * never decoded, so without this the scanned FB can show residual pixels
-     * for the one frame slot before the first video frame lands. */
+    /* Cover any residual pixels in the FBs so only the decoded video shows. */
     launcher_fill_screen();
 
     RTK_LOGI(TAG, "-> MJPEG video #%d\n", index);
@@ -322,8 +321,8 @@ static void launcher_poll_cb(lv_timer_t* timer)
 {
     LV_UNUSED(timer);
 
-    /* 1) Video ended → the full launcher_show(), on this thread (see
-     * launcher_show_pending). */
+    /* 1) Video ended → show the launcher on the LVGL thread (the player's
+     * end-callback only set this flag; see launcher_show_pending). */
     if (s_video_end_pending)
     {
         s_video_end_pending = false;
@@ -339,15 +338,19 @@ static void launcher_poll_cb(lv_timer_t* timer)
     }
     if (s_video_was_on)
     {
-        /* Backstop for the falling edge, in case the flag was never posted. */
+        /* Defensive: player already gone but end-callback raced and dropped
+         * the flag — still re-show.  Never decode the album underneath (that
+         * painted a photo over the launcher's OPAQUE bg). */
         s_video_was_on = false;
         if (s_mode != MODE_LAUNCHER)
             launcher_show();
         return;
     }
 
-    /* 2) 3-finger tap in the album returns here.  During playback the player
-     * task consumes the same latch, so this only covers the album. */
+    /* 2) 3-finger tap in the ALBUM returns to the launcher.  (While the
+     * launcher is up this never applies; during playback the player task polls
+     * the same driver latch and won't exit until released, so it can't
+     * double-run.) */
     if (touch_gt911_get_three_tap())
     {
         if (s_mode != MODE_LAUNCHER)
