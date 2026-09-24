@@ -16,9 +16,10 @@
  * back to the launcher.
  */
 
-/* Playback rate (frames per second). */
+/* Playback rate (frames per second).  HW decode saturates before 30 fps on
+ * large frames; 24 keeps realtime headroom while the disk keeps up. */
 #ifndef MJPEG_PLAY_FPS
-#define MJPEG_PLAY_FPS 30
+#define MJPEG_PLAY_FPS 24
 #endif
 
 /* Cap on video folders found in the SD root.  Mirrors the storage-layer

@@ -399,8 +399,11 @@ int mjpeg_play(int index)
     s_active    = true;
     s_run       = true;
 
+    /* Stack 12 KB: cursor streaming calls f_open_by_dir/f_read through a local
+     * FIL, and FatFS embeds a 4 KB read/write window per FIL (FF_FS_TINY=0) —
+     * the old 4 KB stack overflowed (UFSR STKOF) on the first streamed frame. */
     if (rtos_task_create(NULL, "mjpeg_play", (rtos_task_t) mjpeg_play_task,
-                         (void*) (intptr_t) index, 4096, 3) != RTK_SUCCESS)
+                         (void*) (intptr_t) index, 12 * 1024, 3) != RTK_SUCCESS)
     {
         RTK_LOGE(TAG, "create play task failed\n");
         s_active = false;

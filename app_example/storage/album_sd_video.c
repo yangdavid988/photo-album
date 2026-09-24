@@ -5,8 +5,14 @@
  * and serves one frame at a time (album_sd_video_frame).  A "video" is a
  * sub-folder holding sequentially-numbered baseline JPEG frames; the scan is
  * single-level — every direct child of MJPEG/ is a candidate, a child without
- * numbered JPEG frames is skipped.  Frame order comes from the number in each
- * 8.3 name, never from readdir order, which would put frame_2 after frame_10.
+ * numbered JPEG frames is skipped.
+ *
+ * Playback prepares once per video (album_sd_video_prepare) by holding ONE live
+ * directory cursor into the folder; frames are pulled straight off that cursor
+ * with FatFS open-by-cursor (f_open_by_dir / f_dir_next), so the cost per frame
+ * is O(1) — no per-frame name open, no directory re-scan (see the open-by-cursor
+ * note below).  Stream order is the directory's physical readdir order, which
+ * for ffmpeg/phone-produced clips equals ascending camera-counter order.
  */
 #include "album_sd_video.h"
 
@@ -20,14 +26,24 @@
 #include "vfs_fatfs.h"
 #include "storage/album_sd.h" /* album_sd_mounted() for the mount gate */
 
+/* Open-by-cursor: old playback opened every frame by name
+ * (f_open("vol:/video/00001441.jpg")).  FatFS's dir_find() walks the whole
+ * directory from entry 0 on every open, so a multi-thousand-frame folder costs
+ * O(N) SD sector reads per frame and read time degrades linearly with the frame
+ * index.  Enumerating once and streaming from the live DIR cursor with
+ * f_open_by_dir()/f_dir_next() skips path lookup entirely — O(1) per frame.
+ * Stream order == directory physical order, which is safe because the frames
+ * are written sequentially by ffmpeg/phone cameras.  No name table, no sort,
+ * no per-frame path string. */
+
 #ifndef TAG
 #define TAG "SD_VIDEO"
 #endif
 
 /* ---- Tunables ---- */
-#define SDV_MAX_VIDEOS     24  /* cap the MJPEG/ sub-folder listing      */
-#define SDV_MAX_FRAMES     1024 /* cap frames per video                  */
-#define SDV_MJPEG_DIR      "MJPEG" /* video folders live under this dir  */
+#define SDV_MAX_VIDEOS 24    /* cap the MJPEG/ sub-folder listing      */
+#define SDV_MAX_FRAMES 5120  /* max frames per video (6-digit counters) */
+#define SDV_MJPEG_DIR  "MJPEG" /* video folders live under this root dir */
 
 /* Shared PSRAM stream buffer holding ONE JPEG frame at a time.  Reuses the
  * photo path's 2 MB pool (album_sd_stream_buffer) — photo and video playback
@@ -36,12 +52,12 @@
 static uint8_t* s_frame_buf   = NULL;
 static uint32_t s_frame_bufsz = 0;
 
-/* Per-video prepared state: sorted frame file names.  Only one video is
- * prepared at a time.  64 bytes per name covers LFN stems like
- * "frame_000001.jpg". */
-static char s_frame_names[SDV_MAX_FRAMES][64];
-static int  s_prepared = 0; /* frame count of the prepared video */
-static char s_prep_path[160]; /* full "vol:folder/" of the prepared video */
+/* Per-video prepared state: ONE live directory cursor into the playing video's
+ * folder.  Frames are streamed off it with f_open_by_dir()/f_dir_next().
+ * Only one video is prepared at a time; the cursor stays open until the next
+ * prepare() (or unmount). */
+static void* s_dir   = NULL; /* opendir() handle of the prepared video */
+static int   s_nprep = 0;    /* frame count of the prepared video      */
 
 /* ---- Numeric counter helpers ------------------------------------------ */
 
@@ -59,28 +75,6 @@ static int stem_counter(const char* name)
         n++;
     }
     return (n >= 1) ? (int) v : -1;
-}
-
-/* Simple selection sort over the prepared frame list, by camera counter. */
-static void frame_sort(void)
-{
-    for (int i = 0; i < s_prepared; i++)
-    {
-        int best = i;
-        for (int j = i + 1; j < s_prepared; j++)
-        {
-            if (stem_counter(s_frame_names[j]) <
-                stem_counter(s_frame_names[best]))
-                best = j;
-        }
-        if (best != i)
-        {
-            char tmp[64];
-            memcpy(tmp, s_frame_names[i], sizeof(tmp));
-            memcpy(s_frame_names[i], s_frame_names[best], sizeof(tmp));
-            memcpy(s_frame_names[best], tmp, sizeof(tmp));
-        }
-    }
 }
 
 /* Is this file name a JPEG the HX170 can consume?  Accepts .jpg/.jpeg/.jpe
@@ -213,7 +207,7 @@ int album_sd_scan_videos(sd_video_t* list, int max)
 
 int album_sd_video_prepare(const sd_video_t* video)
 {
-    s_prepared = 0;
+    s_nprep = 0;
     if (video == NULL)
         return 0;
 
@@ -221,7 +215,12 @@ int album_sd_video_prepare(const sd_video_t* video)
     if (s_frame_buf == NULL)
         s_frame_buf = album_sd_stream_buffer(&s_frame_bufsz);
 
-    snprintf(s_prep_path, sizeof(s_prep_path), "%s", video->path);
+    /* Release a previous cursor before opening the new one. */
+    if (s_dir != NULL)
+    {
+        closedir(s_dir);
+        s_dir = NULL;
+    }
 
     void* dir = opendir(video->path);
     if (dir == NULL)
@@ -230,72 +229,93 @@ int album_sd_video_prepare(const sd_video_t* video)
         return 0;
     }
 
-    struct dirent* se;
-    while ((se = readdir(dir)) != NULL && s_prepared < SDV_MAX_FRAMES)
+    /* The frame count is already known from album_sd_scan_videos and carried
+     * in video->frame_count.  Keep ONE directory cursor open for streaming. */
+    s_dir   = dir;
+    s_nprep = video->frame_count;
+
+    /* Park the cursor on the FIRST openable file — f_opendir leaves it on the
+     * folder's first entry ('.'), so advance once; the first frame() call then
+     * opens frame 0, not a directory entry.  FR_NO_FILE means the folder has
+     * no openable entry — bail out early. */
+    if (f_dir_next((DIR*) ((vfs_file*) dir)->file) != FR_OK)
     {
-        if (se->d_type != DT_REG)
-            continue;
-        if (se->d_name[0] == '.')
-            continue;
-        if (!is_jpeg_name(se->d_name))
-            continue;
-        if (stem_counter(se->d_name) < 0)
-            continue;
-        snprintf(s_frame_names[s_prepared], sizeof(s_frame_names[0]), "%s",
-                 se->d_name);
-        s_prepared++;
+        RTK_LOGE(TAG, "prepare: '%s' has no openable entry\n", video->name);
+        closedir(dir);
+        s_dir   = NULL;
+        s_nprep = 0;
+        return 0;
     }
-    closedir(dir);
 
-    frame_sort();
-
-    RTK_LOGI(TAG, "'%s' prepared %d frames\n", video->name, s_prepared);
-    return s_prepared;
+    RTK_LOGI(TAG, "'%s' prepared %d frames (cursor stream)\n", video->name,
+             s_nprep);
+    return s_nprep;
 }
 
 const uint8_t* album_sd_video_frame(int n, uint32_t* len)
 {
-    if (n < 0 || n >= s_prepared)
+    if (s_dir == NULL || n < 0 || n >= s_nprep)
     {
-        RTK_LOGE(TAG, "frame index %d out of range (%d)\n", n, s_prepared);
+        RTK_LOGE(TAG, "frame index %d out of range (%d)\n", n, s_nprep);
         return NULL;
     }
 
-    char path[VFS_PATH_MAX];
-    int plen = snprintf(path, sizeof(path), "%s%s", s_prep_path,
-                        s_frame_names[n]);
-    if (plen <= 0 || plen >= (int) sizeof(path))
-        return NULL;
+    /* Open the entry the cursor currently sits on (O(1) — no dir_find path
+     * walk), read it, close it, then advance the cursor to the next entry.
+     * At the end of a pass the cursor sits on the EOT marker; when playback
+     * wraps (n back to 0) rewind the cursor so the pass restarts at frame 0. */
+    DIR* dir = (DIR*) ((vfs_file*) s_dir)->file;
+    FIL  fil;
 
-    FILE* f = fopen(path, "rb");
-    if (f == NULL)
+    if (n == 0)
     {
-        RTK_LOGE(TAG, "frame: fopen(\"%s\") failed\n", path);
+        /* f_rewinddir parks the cursor on the folder's first entry ('.') —
+         * skip past it to the first frame, mirroring the prepare() park. */
+        f_rewinddir(dir);
+        f_dir_next(dir);
+    }
+
+    memset(&fil, 0, sizeof(fil));
+    if (f_open_by_dir(&fil, dir) != FR_OK)
+    {
+        RTK_LOGW(TAG, "frame %d: open_by_dir skip\n", n);
+        f_dir_next(dir);
         return NULL;
     }
 
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size <= 0 || (unsigned long) size > (unsigned long) s_frame_bufsz)
+    /* Read the whole frame without seeking to EOF first: a seek-to-END on
+     * FatFS walks the file's full FAT cluster chain just to learn a size the
+     * open already knows.  Read straight to EOF, bounded by the shared buffer. */
+    size_t total = 0;
+    while (total < (size_t) s_frame_bufsz)
     {
-        RTK_LOGE(TAG, "frame: bad size %d\n", (int) size);
-        fclose(f);
+        UINT got = 0;
+        if (f_read(&fil, s_frame_buf + total,
+                   (UINT) ((size_t) s_frame_bufsz - total), &got) != FR_OK)
+            break;
+        if (got == 0)
+            break;
+        total += (size_t) got;
+    }
+    f_close(&fil);
+
+    f_dir_next(dir); /* advance the cursor for the next call */
+
+    if (total == 0)
+    {
+        RTK_LOGE(TAG, "frame: empty read\n");
         return NULL;
     }
-
-    size_t got = fread(s_frame_buf, 1, (size_t) size, f);
-    fclose(f);
-    if (got != (size_t) size)
+    if (total >= (size_t) s_frame_bufsz) /* 2 MB cap — a frame never fills it */
     {
-        RTK_LOGE(TAG, "frame: short read %d/%d\n", (int) got, (int) size);
+        RTK_LOGE(TAG, "frame: buffer full (%d bytes)\n", (int) total);
         return NULL;
     }
 
     /* Frame bytes were read by CPU into PSRAM — make cache coherent for the
      * hardware JPEG DMA that will consume them. */
-    DCache_CleanInvalidate((u32) s_frame_buf, (u32) size);
+    DCache_CleanInvalidate((u32) s_frame_buf, (u32) total);
 
-    *len = (uint32_t) size;
+    *len = (uint32_t) total;
     return s_frame_buf;
 }
