@@ -71,25 +71,38 @@ A launcher screen routes between two modes:
 ```
 .
 ├── app_example/
-│   ├── main/app_main.c             # boot + LVGL render loop (from mcu-pc-dashboard)
-│   ├── core/jpeg_decode.c/.h       # MJPEG + PP hardware decode wrapper (+ persistent session)
-│   ├── core/mjpeg_player.c/.h      # clip playback task: FB ping-pong, pacing, gestures
-│   ├── core/brightness_osd.c/.h    # brightness pill drawn straight into an FB
-│   ├── ui/launcher_ui.c/.h         # boot screen + photo/video mode router
-│   ├── ui/album_ui.c/.h            # canvas + info bar + gestures + slideshow
-│   ├── ui/mjpeg_picker_ui.c/.h     # multi-clip picker (paginated card grid)
-│   ├── hal/lcd/                    # T1720A LCDC driver (from mcu-pc-dashboard)
-│   ├── hal/touch/                  # GT911 (from mcu-pc-dashboard, + multi-finger chord detection)
-│   ├── hal/backlight_ctrl.c        # TIM4 PWM backlight (from mcu-pc-dashboard)
-│   ├── storage/album_sd.c/.h       # SD-card photo source (VFS + FatFS, hot-plug)
-│   ├── storage/album_sd_video.c/.h # SD-card clip source (frame folders)
-│   ├── assets/photos/              # ← generated photo tables (jpg2album.py)
-│   ├── assets/icons/               # ← generated launcher icons (gen_launcher_icons.py)
-│   └── config/                     # album tunables, LVGL override, threshold config
-├── tools/jpg2album.py              # JPEG → C array generator (with --max-kb re-encode)
-├── tools/gen_launcher_icons.py     # launcher icon generator (A8 alpha masks)
+│   ├── config/                     # album tunables, LVGL override, threshold config
+│   │   ├── album_config.h          # slideshow interval, info-bar height/auto-hide
+│   │   ├── threshold_config.h      # brightness step / floor / enable
+│   │   └── lv_conf_project.h       # LVGL font/feature override
+│   ├── main/
+│   │   └── app_main.c              # boot + LVGL render loop (from mcu-pc-dashboard)
+│   ├── core/
+│   │   ├── jpeg_decode.c/.h        # MJPEG + PP hardware decode wrapper (+ persistent session)
+│   │   ├── mjpeg_player.c/.h       # clip playback task: FB ping-pong, pacing, gestures
+│   │   └── brightness_osd.c/.h     # brightness pill drawn straight into an FB
+│   ├── ui/
+│   │   ├── launcher_ui.c/.h        # boot screen + photo/video mode router
+│   │   ├── album_ui.c/.h           # canvas + info bar + gestures + slideshow
+│   │   └── mjpeg_picker_ui.c/.h    # multi-clip picker (paginated card grid)
+│   ├── hal/
+│   │   ├── lcd/                    # T1720A LCDC driver (from mcu-pc-dashboard)
+│   │   ├── touch/                  # GT911 (from mcu-pc-dashboard, + multi-finger chord detection)
+│   │   └── backlight_ctrl.c/.h     # TIM4 PWM backlight (from mcu-pc-dashboard)
+│   ├── storage/
+│   │   ├── album_sd.c/.h           # SD-card photo source (VFS + FatFS, hot-plug)
+│   │   └── album_sd_video.c/.h     # SD-card clip source (frame folders)
+│   └── assets/
+│       ├── photos/                 # ← generated photo tables (jpg2album.py)
+│       └── icons/                  # ← generated launcher icons (gen_launcher_icons.py)
+├── tools/
+│   ├── jpg2album.py                # JPEG → C array generator (with --max-kb re-encode)
+│   └── gen_launcher_icons.py       # launcher icon generator (A8 alpha masks)
+├── SDcard/                         # ready-to-copy card media (28 photos + NAV clip)
 ├── photos_in/                      # drop your .jpg here (13 sample photos included)
-└── Kconfig / prj.conf              # T1720A + LVGL 9.3 config
+├── launcher_demo.gif               # boot-screen preview
+├── Kconfig / prj.conf              # T1720A + LVGL 9.3 config
+└── build_RTL8721F/                 # build output (generated)
 ```
 ---
 

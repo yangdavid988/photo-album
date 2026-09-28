@@ -70,25 +70,38 @@
 ```
 photo_album_demo/
 ├── app_example/
-│   ├── main/app_main.c             # 启动 + LVGL 渲染循环（源自 mcu-pc-dashboard）
-│   ├── core/jpeg_decode.c/.h       # MJPEG + PP 硬件解码封装（含持久会话）
-│   ├── core/mjpeg_player.c/.h      # 片段播放任务：FB 乒乓、节奏控制、手势
-│   ├── core/brightness_osd.c/.h    # 直接绘制到 FB 的亮度浮层
-│   ├── ui/launcher_ui.c/.h         # 启动屏 + 照片/视频模式路由
-│   ├── ui/album_ui.c/.h            # 画布 + 信息栏 + 手势 + 幻灯片
-│   ├── ui/mjpeg_picker_ui.c/.h     # 多片段选择器（分页卡片网格）
-│   ├── hal/lcd/                    # T1720A LCDC 驱动（源自 mcu-pc-dashboard）
-│   ├── hal/touch/                  # GT911（源自 mcu-pc-dashboard，+ 多指和弦检测）
-│   ├── hal/backlight_ctrl.c        # TIM4 PWM 背光（源自 mcu-pc-dashboard）
-│   ├── storage/album_sd.c/.h       # SD 卡照片源（VFS + FatFS，热插拔）
-│   ├── storage/album_sd_video.c/.h # SD 卡片段源（帧文件夹）
-│   ├── assets/photos/              # ← 生成的图片表（jpg2album.py）
-│   ├── assets/icons/               # ← 生成的启动器图标（gen_launcher_icons.py）
-│   └── config/                     # 相册调参、LVGL 覆盖、阈值配置
-├── tools/jpg2album.py              # JPEG → C 数组生成器（含 --max-kb 重新编码）
-├── tools/gen_launcher_icons.py     # 启动器图标生成器（A8 alpha 掩码）
+│   ├── config/                     # 相册调参、LVGL 覆盖、阈值配置
+│   │   ├── album_config.h          # 幻灯片间隔、信息栏高度/自动隐藏
+│   │   ├── threshold_config.h      # 亮度步进 / 下限 / 开关
+│   │   └── lv_conf_project.h       # LVGL 字体/功能覆盖
+│   ├── main/
+│   │   └── app_main.c              # 启动 + LVGL 渲染循环（源自 mcu-pc-dashboard）
+│   ├── core/
+│   │   ├── jpeg_decode.c/.h        # MJPEG + PP 硬件解码封装（含持久会话）
+│   │   ├── mjpeg_player.c/.h       # 片段播放任务：FB 乒乓、节奏控制、手势
+│   │   └── brightness_osd.c/.h     # 直接绘制到 FB 的亮度浮层
+│   ├── ui/
+│   │   ├── launcher_ui.c/.h        # 启动屏 + 照片/视频模式路由
+│   │   ├── album_ui.c/.h           # 画布 + 信息栏 + 手势 + 幻灯片
+│   │   └── mjpeg_picker_ui.c/.h    # 多片段选择器（分页卡片网格）
+│   ├── hal/
+│   │   ├── lcd/                    # T1720A LCDC 驱动（源自 mcu-pc-dashboard）
+│   │   ├── touch/                  # GT911（源自 mcu-pc-dashboard，+ 多指和弦检测）
+│   │   └── backlight_ctrl.c/.h     # TIM4 PWM 背光（源自 mcu-pc-dashboard）
+│   ├── storage/
+│   │   ├── album_sd.c/.h           # SD 卡照片源（VFS + FatFS，热插拔）
+│   │   └── album_sd_video.c/.h     # SD 卡片段源（帧文件夹）
+│   └── assets/
+│       ├── photos/                 # ← 生成的图片表（jpg2album.py）
+│       └── icons/                  # ← 生成的启动器图标（gen_launcher_icons.py）
+├── tools/
+│   ├── jpg2album.py                # JPEG → C 数组生成器（含 --max-kb 重新编码）
+│   └── gen_launcher_icons.py       # 启动器图标生成器（A8 alpha 掩码）
+├── SDcard/                         # 可直接拷贝的卡内容（28 张照片 + NAV 片段）
 ├── photos_in/                      # 放入你的 .jpg（已含 13 张示例照片）
-└── Kconfig / prj.conf              # T1720A + LVGL 9.3 配置
+├── launcher_demo.gif               # 启动屏预览
+├── Kconfig / prj.conf              # T1720A + LVGL 9.3 配置
+└── build_RTL8721F/                 # 构建输出（生成）
 ```
 
 ---
